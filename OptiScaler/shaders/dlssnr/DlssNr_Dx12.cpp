@@ -8,6 +8,7 @@
 #include <dlssnr/DlssNr_Capture.h>
 #include <dlssnr/DlssNr_Proxy.h>
 #include <dlssnr/DlssNr_ExposureScan.h>
+#include <dlssnr/DlssNr_Hip.h>
 
 #include "DlssNr_Dx12.h"
 
@@ -1640,7 +1641,23 @@ void DlssNr_Dx12::Dispatch(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* c
     if (cfg.DlssNrProxyProbe.value_or_default())
         ProbeProxyDispatch(cmdList);
 
-    if (!EnsureForwarder() || !EnsureCapabilityParams(device))
+    // Which implementation of the model this session runs. On a Radeon there is no NGX to route
+    // feature 18 through, so the network runs natively through HIP instead; everything else in this
+    // pass -- the proxy, the guides, the resolve -- is the same either way.
+    const bool useHip = DlssNr::Hip::Enabled();
+
+    if (useHip)
+    {
+        if (!DlssNr::Hip::Ensure(device))
+        {
+            g_nr.failed = true;
+            g_nr.reason = DlssNr::Hip::Status();
+            LOG_ERROR("DLSS-NR unavailable: {}", g_nr.reason);
+            device->Release();
+            return;
+        }
+    }
+    else if (!EnsureForwarder() || !EnsureCapabilityParams(device))
     {
         g_nr.failed = true;
         LOG_ERROR("DLSS-NR unavailable: {}", g_nr.reason);
@@ -1655,8 +1672,14 @@ void DlssNr_Dx12::Dispatch(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* c
     // Capped at 2x: cost grows with the area and NGX acceptance above native is what this probe tests.
     float workScale = cfg.DlssNrWorkingScale.value_or_default();
     workScale = workScale < 0.25f ? 0.25f : (workScale > 2.0f ? 2.0f : workScale);
-    const auto workWidth = (unsigned int) (width * workScale + 0.5f);
-    const auto workHeight = (unsigned int) (height * workScale + 0.5f);
+    // The HIP network's weights are for 1920x1080. The working scale is a real control for NGX, which
+    // rebuilds the model at whatever size it is given; here it would simply be a lie, so the pass is
+    // driven at the model's own size and the resolve resamples the answer as it already does for any
+    // working size that is not the frame size.
+    const auto workWidth =
+        useHip ? DlssNr::Hip::ModelWidth : (unsigned int) (width * workScale + 0.5f);
+    const auto workHeight =
+        useHip ? DlssNr::Hip::ModelHeight : (unsigned int) (height * workScale + 0.5f);
     const bool reduced = workWidth != width || workHeight != height;
 
     ReleaseSurfacesIfFormatChanged(desc.Format);
@@ -1740,7 +1763,7 @@ void DlssNr_Dx12::Dispatch(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* c
             LOG_INFO("DLSS-NR: white point meter up, {}x{} tiles", kDlssNrMeterGrid, kDlssNrMeterGrid);
     }
 
-    if (g_nr.feature == nullptr && g_nr.output != nullptr && g_nr.colorCopy != nullptr &&
+    if (!useHip && g_nr.feature == nullptr && g_nr.output != nullptr && g_nr.colorCopy != nullptr &&
         g_nr.hdrCopy != nullptr)
     {
         auto snippet = Util::FindFilePath(g_dllDir, "nvngx_dlssnr.dll");
@@ -1799,7 +1822,22 @@ void DlssNr_Dx12::Dispatch(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* c
         return;
     }
 
-    if (g_nr.feature == nullptr)
+    if (useHip)
+    {
+        // The NGX path records its geometry when it builds the feature. There is no feature here, so
+        // this is where it is recorded -- without it, resolutionChanged stays true and the pass parks
+        // and reallocates its scratch every single frame.
+        if (g_nr.width != width || g_nr.height != height)
+        {
+            g_nr.width = width;
+            g_nr.height = height;
+            g_nr.reset = true;
+            RecordBuiltTuning(cfg);
+            LOG_INFO("DLSS-NR (HIP) running at {}x{}, model {}x{}, guides {}x{}", width, height,
+                     workWidth, workHeight, guideWidth, guideHeight);
+        }
+    }
+    else if (g_nr.feature == nullptr)
     {
         device->Release();
         return;
@@ -2185,7 +2223,19 @@ void DlssNr_Dx12::Dispatch(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* c
 
     // Multi-pass was removed: re-feeding the model its own output re-opened the same-command-list
     // feature-creation hang, and the colour core is not settled enough to build on. One evaluate.
-    const int result = g_nr.evaluate(
+    //
+    // The HIP path is the same evaluate with a different engine behind it, and one difference the
+    // caller can see: it is asynchronous. The network takes some 230 ms on a 7900 XT, so the proxy is
+    // staged, the model runs off the render thread, and the answer lands in g_nr.output a few frames
+    // later. A success here means the exchange is running and the output holds the most recent
+    // finished answer -- exact when the camera is still, and stale by its own latency when it is not.
+    const int result =
+        useHip ? DlssNr::Hip::Evaluate(cmdList,
+                                       timingQueue != nullptr
+                                           ? timingQueue
+                                           : (ID3D12CommandQueue*) State::Instance().currentCommandQueue,
+                                       modelInput, g_nr.output, workWidth, workHeight, g_nr.reset)
+               : g_nr.evaluate(
         cmdList, g_nr.feature, g_nr.capabilityParams, modelInput, depthIn, motionIn, g_nr.output,
         workWidth, workHeight, guideWidth, guideHeight, g_nr.guideDepthInverted ? 1 : 0,
         g_nr.reset ? 1 : 0, cfg.DlssNrIntensity.value_or_default(),
@@ -2216,7 +2266,7 @@ void DlssNr_Dx12::Dispatch(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* c
     // Once, a few seconds in, so it lands after the values have been written at least once.
     static bool tuningReported = false;
 
-    if (!tuningReported && g_frames > 240)
+    if (!useHip && !tuningReported && g_frames > 240)
     {
         tuningReported = true;
 
@@ -2846,6 +2896,10 @@ bool CaptureInProgress() { return g_capture.isActive(); }
 void Shutdown()
 {
     std::lock_guard<std::mutex> nrLock(g_nrMutex);
+
+    // The HIP backend owns a worker thread and two mapped staging buffers; they go first, before any
+    // of the D3D12 objects they copy between are released.
+    DlssNr::Hip::Release();
 
     for (auto& r : g_nrRetired)
     {
