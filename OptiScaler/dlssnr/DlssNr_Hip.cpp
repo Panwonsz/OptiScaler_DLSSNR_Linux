@@ -9,6 +9,7 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <cstdlib>
 #include <cstring>
 #include <mutex>
 #include <string>
@@ -38,6 +39,10 @@ using PFN_LastError = const char* (*) ();
 using PFN_Shutdown = void (*)();
 
 constexpr size_t kPixels = size_t(ModelWidth) * size_t(ModelHeight);
+
+// Printed at init. Two builds in a row produced an identical failure, and nothing in the log said
+// whether the second one was the DLL actually being loaded.
+constexpr const char* kBuildMark = "2026-09-18c";
 
 // ---------------------------------------------------------------------------------------------
 // Pixel conversion.
@@ -656,10 +661,21 @@ int GuardedRecord(ID3D12GraphicsCommandList* cmdList, ID3D12CommandQueue* queue,
 
         if (stage)
         {
+            // modelInput arrives as NON_PIXEL_SHADER_RESOURCE, not a UAV. The pass transitions it
+            // there before the model is called, because NGX reads the proxy as a shader resource:
+            //
+            //   Barrier(cmdList, g_nr.colorCopy,  UNORDERED_ACCESS -> NON_PIXEL_SHADER_RESOURCE)
+            //   Barrier(cmdList, g_nr.colorSmall, UNORDERED_ACCESS -> NON_PIXEL_SHADER_RESOURCE)
+            //
+            // and restores it afterwards. A barrier is not validated when it is recorded, only when
+            // it runs, so naming the wrong before-state records cleanly and then faults the queue --
+            // which is how the first version reached step 6 and lost the device two seconds later.
             step = 5;
-            Barrier(cmdList, modelInput, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+            Barrier(cmdList, modelInput, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                    D3D12_RESOURCE_STATE_COPY_SOURCE);
             CopyTextureToBuffer(cmdList, modelInput, g.readback);
-            Barrier(cmdList, modelInput, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+            Barrier(cmdList, modelInput, D3D12_RESOURCE_STATE_COPY_SOURCE,
+                    D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
             step = 6;
         }
     }
@@ -728,6 +744,37 @@ bool CreateStaging(ID3D12Device* device, const D3D12_RESOURCE_DESC& desc)
 }
 
 } // namespace
+
+// How much of the exchange to record, from DLSS5_NR_STEPS:
+//
+//   0  nothing at all -- the model still loads and allocates, but no fence and no copies
+//   1  the fence signal only
+//   2  the signal and the staging copy (the proxy going out)
+//   3  everything, including delivering the answer back (the default)
+//
+// The first staged frame kills the GPU with VK_ERROR_DEVICE_LOST two seconds later, and a device
+// loss names nothing that caused it. Each rebuild costs a round trip through CI, so the bisect lives
+// in the build: three launches say whether the recording is involved at all, and if so which half.
+int StepLimit()
+{
+    static int limit = -1;
+
+    if (limit < 0)
+    {
+        char value[16] {};
+        limit = 3;
+
+        if (GetEnvironmentVariableA("DLSS5_NR_STEPS", value, sizeof(value)) != 0)
+        {
+            const int asked = atoi(value);
+
+            if (asked >= 0 && asked <= 3)
+                limit = asked;
+        }
+    }
+
+    return limit;
+}
 
 bool Enabled()
 {
@@ -810,7 +857,8 @@ bool Ensure(ID3D12Device* device)
     g.device = device;
     g.modelReady = true;
     Say("ready");
-    LOG_INFO("DLSS-NR (HIP): model initialised from {}, running at {}x{}", weights, ModelWidth, ModelHeight);
+    LOG_INFO("DLSS-NR (HIP): model initialised from {}, running at {}x{} [build {} step limit {}]",
+             weights, ModelWidth, ModelHeight, kBuildMark, StepLimit());
     return true;
 }
 
@@ -913,6 +961,21 @@ int Evaluate(ID3D12GraphicsCommandList* cmdList, ID3D12CommandQueue* queue, ID3D
             g.stage = Exchange::Stage::Recorded;
         }
     }
+
+    const int limit = StepLimit();
+
+    if (limit == 0)
+    {
+        std::lock_guard<std::mutex> held(g.lock);
+        g.stage = Exchange::Stage::Idle; // nothing recorded, so nothing is pending
+        return 0;
+    }
+
+    if (limit < 3)
+        deliver = false;
+
+    if (limit < 2)
+        stage = false;
 
     const int reached = GuardedRecord(cmdList, queue, modelInput, output, tick, deliver ? 1 : 0, stage ? 1 : 0);
 
