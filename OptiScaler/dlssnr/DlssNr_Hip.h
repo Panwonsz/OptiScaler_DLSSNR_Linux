@@ -47,7 +47,9 @@ bool Ensure(ID3D12Device* device);
 // Records the frame's half of the exchange on the caller's command list and returns the NGX-shaped
 // result the pass expects: 1 on success, 0 when there is nothing to do or something failed.
 //
-// - modelInput is the proxy the model is shown, at exactly ModelWidth x ModelHeight
+// - modelInput is the proxy the model is shown, at exactly ModelWidth x ModelHeight, and in
+//   NON_PIXEL_SHADER_RESOURCE -- the state the pass puts it in for the model, and the state this
+//   restores it to after copying from it
 // - output receives the model's answer, same size, same format
 // - queue is the queue this list will be executed on; the exchange needs it to know when a copy it
 //   recorded has actually run, and without it nothing can be handed to the model
