@@ -25,15 +25,22 @@
 // the host, because NGX cannot run it here and ROCm cannot run in here.
 //
 // The model used to live in this process, loaded through dlss5_hip.dll and a preloaded
-// libdlss5_hip.so. That design died on the evidence: Stellar Blade lost the device two seconds into
-// the first frame even with DLSS5_NR_STEPS=0, where this backend records *nothing* on the game's
-// command list and does no more than let the model initialise. The recording was never the problem.
-// ROCm compute and vkd3d graphics sharing one process on one GPU under Wine is.
+// libdlss5_hip.so. It now lives in dlss5-nr-daemon, an ordinary Linux process on the host that holds
+// the weights and answers frames on 127.0.0.1, where it is measured at 234 ms a frame on a 7900 XT.
 //
-// So the model moved out, into dlss5-nr-daemon: an ordinary Linux process on the host that holds the
-// weights and answers frames on 127.0.0.1. Everything on this side that was already right stays --
-// the staging pair, the fence ordering, the worker thread, the late composition. The only thing that
-// changes is what the worker calls at the end of it: a socket instead of dlss5_run.
+// Read the reason for that carefully, because the first version of this comment got it wrong. The
+// claim was that a run with the recording switched off still lost the device, so the recording could
+// not be the cause and the model had to be what did it. The switch was broken: the queue signal sat
+// above its gate, so that run still created both staging buffers, started the worker and signalled
+// the game's queue every frame. It proved nothing. What is actually known:
+//
+//   - with the model out of the process entirely, the game still dies at the same moment, so ROCm
+//     in the game process was not the only cause and may not have been a cause at all
+//   - with this backend failing at Ensure -- nothing created, nothing recorded -- the game runs
+//
+// So the culprit is somewhere between those two, in what this file does on the game's device, and
+// Mode() below exists to say where. Moving the model out is still right: it removes an unknown and
+// it is the only place the network reaches full speed. But it was not the fix.
 
 namespace DlssNr
 {
@@ -76,7 +83,7 @@ struct Response
 
 // Printed at init. Two builds in a row produced an identical failure, and nothing in the log said
 // whether the second one was the DLL actually being loaded.
-constexpr const char* kBuildMark = "2026-09-18d";
+constexpr const char* kBuildMark = "2026-09-19a";
 
 // ---------------------------------------------------------------------------------------------
 // Pixel conversion does not happen here any more.
@@ -152,6 +159,14 @@ struct Exchange
     UINT64 readableAt = 0;   // fence tick at which the staged proxy is readable
     UINT64 writableAt = 0;   // fence tick after which the upload buffer may be rewritten
     bool haveAnswer = false; // the output texture holds a finished answer from some earlier frame
+
+    // The other clock. Mode 5 never touches the game's queue, so it cannot signal a fence and cannot
+    // know when a copy ran; instead it counts frames and assumes a copy recorded three frames ago has
+    // long since executed. At four model frames a second the margin is enormous.
+    UINT64 frame = 0;
+    UINT64 recordedAtFrame = 0;
+    UINT64 deliveredAtFrame = 0;
+
     bool quit = false;
     unsigned int seed = 0;
     float lastMs = 0.0f;
@@ -291,7 +306,8 @@ void WorkerMain()
         }
 
         // Wait for the copy that staged the proxy, and for the GPU to be done with whatever the
-        // upload buffer last carried.
+        // upload buffer last carried. In mode 5 there is no fence at all and Evaluate has already
+        // counted the frames, so there is nothing to wait for here.
         if (g.fence != nullptr && ready != nullptr)
         {
             if (g.fence->GetCompletedValue() < waitFor)
@@ -445,14 +461,16 @@ bool QueueLooksReal(ID3D12CommandQueue* queue)
 //
 // Returns the step it reached (1 signal, 2-4 deliver, 5-6 stage); negative means it faulted there.
 int GuardedRecord(ID3D12GraphicsCommandList* cmdList, ID3D12CommandQueue* queue, ID3D12Resource* modelInput,
-                  ID3D12Resource* output, unsigned long long tick, int deliver, int stage)
+                  ID3D12Resource* output, unsigned long long tick, int deliver, int stage, int signalQueue)
 {
     int step = 0;
 
     __try
     {
         step = 1;
-        queue->Signal(g.fence, tick);
+
+        if (signalQueue)
+            queue->Signal(g.fence, tick);
 
         if (deliver)
         {
@@ -492,7 +510,45 @@ int GuardedRecord(ID3D12GraphicsCommandList* cmdList, ID3D12CommandQueue* queue,
     return step;
 }
 
-bool CreateStaging(ID3D12Device* device, const D3D12_RESOURCE_DESC& desc)
+// Printed once, on the first frame that gets this far. A device loss names nothing that caused it, so
+// the cheap facts go in the log while they can still be collected: above all whether the command queue
+// the pass handed us belongs to the same device as the textures it hands us. Signalling a fence from a
+// queue of one device against a fence created on another is exactly the sort of thing that takes a GPU
+// down two seconds later, and it would look identical to everything else we have seen.
+void Describe(ID3D12Device* device, ID3D12CommandQueue* queue, ID3D12Resource* output, const D3D12_RESOURCE_DESC& desc,
+              int mode)
+{
+    const void* queueDevice = nullptr;
+    D3D12_COMMAND_QUEUE_DESC queueDesc {};
+
+    if (queue != nullptr)
+    {
+        ID3D12Device* owner = nullptr;
+
+        if (SUCCEEDED(queue->GetDevice(IID_PPV_ARGS(&owner))) && owner != nullptr)
+        {
+            queueDevice = owner;
+            owner->Release();
+        }
+
+        queueDesc = queue->GetDesc();
+    }
+
+    const char* verdict = queue == nullptr         ? "(no queue was handed to us)"
+                          : queueDevice == nullptr ? "(the queue would not name its device)"
+                          : queueDevice == device  ? "same device"
+                                                   : "DIFFERENT DEVICE -- this alone would explain the loss";
+
+    const D3D12_RESOURCE_DESC out = output->GetDesc();
+
+    LOG_INFO("DLSS-NR (HIP): mode {} | texture device {} | queue device {} -> {} | queue type {} flags {}", mode,
+             (const void*) device, queueDevice, verdict, (int) queueDesc.Type, (int) queueDesc.Flags);
+    LOG_INFO("DLSS-NR (HIP): input {}x{} fmt {} flags {} | output {}x{} fmt {} flags {}", (unsigned) desc.Width,
+             (unsigned) desc.Height, (int) desc.Format, (int) desc.Flags, (unsigned) out.Width, (unsigned) out.Height,
+             (int) out.Format, (int) out.Flags);
+}
+
+bool CreateStaging(ID3D12Device* device, const D3D12_RESOURCE_DESC& desc, bool needFence)
 {
     UINT rows = 0;
     UINT64 rowBytes = 0;
@@ -535,7 +591,7 @@ bool CreateStaging(ID3D12Device* device, const D3D12_RESOURCE_DESC& desc)
         return false;
     }
 
-    if (FAILED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&g.fence))))
+    if (needFence && FAILED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&g.fence))))
     {
         Fail("the fence could not be created");
         return false;
@@ -548,37 +604,47 @@ bool CreateStaging(ID3D12Device* device, const D3D12_RESOURCE_DESC& desc)
 
 } // namespace
 
-// How much of the exchange to record, from DLSS5_NR_STEPS:
+// What this backend is allowed to do, from DLSS5_NR_MODE. Each mode is a strict superset of the one
+// below it, and mode 0 really does nothing:
 //
-//   0  nothing at all -- the daemon is still contacted, but no fence and no copies
-//   1  the fence signal only
-//   2  the signal and the staging copy (the proxy going out)
-//   3  everything, including delivering the answer back (the default)
+//   0  nothing at all -- Evaluate returns immediately; the pass runs on without a model
+//   1  create the staging buffers, map them, start the worker, and stop there
+//   2  as 1, plus signal the game's command queue once per frame
+//   3  as 2, plus record the staging copy (the proxy going out)
+//   4  as 3, plus deliver the answer back over the output -- this is what has been crashing
+//   5  as 4 but never touching the game's queue: no fence, no Signal. Copies go on the game's list
+//      and frames are counted instead. The default, because it is the one thing not yet ruled out.
 //
-// This was built to bisect a device loss that turned out not to be about the recording at all: the
-// GPU died two seconds in even at 0, which is what sent the model out of this process. It stays
-// because each rebuild costs a round trip through CI, and having the bisect already in the binary
-// is worth the twenty lines the next time something dies without naming itself.
-int StepLimit()
+// The switch this replaces was wrong in a way that cost a night. The queue signal sat *above* the
+// gate, so mode "0" still created every resource, started the worker and signalled the game's queue
+// on every frame -- and its crash was read as proof that nothing recorded here could matter. It was
+// not proof of anything. Hence the nesting above, and hence mode 0 returning before it touches
+// anything at all.
+int Mode()
 {
-    static int limit = -1;
+    static int mode = -1;
 
-    if (limit < 0)
+    if (mode < 0)
     {
         char value[16] {};
-        limit = 3;
+        mode = 5;
 
-        if (GetEnvironmentVariableA("DLSS5_NR_STEPS", value, sizeof(value)) != 0)
+        if (GetEnvironmentVariableA("DLSS5_NR_MODE", value, sizeof(value)) != 0)
         {
             const int asked = atoi(value);
 
-            if (asked >= 0 && asked <= 3)
-                limit = asked;
+            if (asked >= 0 && asked <= 5)
+                mode = asked;
         }
     }
 
-    return limit;
+    return mode;
 }
+
+// How many frames to let pass before assuming a recorded copy has run, in the modes that have no
+// fence to ask. Three is far more than the one or two frames a submission is ever behind, and at four
+// model frames a second it costs nothing.
+constexpr UINT64 kFrameLag = 3;
 
 bool Enabled()
 {
@@ -645,8 +711,8 @@ bool Ensure(ID3D12Device* device)
     g.modelReady = true;
     Say("ready");
     LOG_INFO("DLSS-NR (HIP): connected to dlss5-nr-daemon on 127.0.0.1:{}, running at {}x{} "
-             "[build {} step limit {}]",
-             port, ModelWidth, ModelHeight, kBuildMark, StepLimit());
+             "[build {} mode {}]",
+             port, ModelWidth, ModelHeight, kBuildMark, Mode());
     return true;
 }
 
@@ -656,24 +722,34 @@ int Evaluate(ID3D12GraphicsCommandList* cmdList, ID3D12CommandQueue* queue, ID3D
     if (g_failed || cmdList == nullptr || modelInput == nullptr || output == nullptr)
         return 0;
 
+    const int mode = Mode();
+
+    if (mode == 0)
+        return 0;
+
     if (workWidth != ModelWidth || workHeight != ModelHeight)
     {
         Fail("the model runs at 1920x1080 only, and this frame asked for another size");
         return 0;
     }
 
-    if (queue == nullptr)
-    {
-        // Without the queue there is no way to know when a copy has run, and reading a buffer the
-        // GPU may not have written yet would show the model a frame of noise.
-        Say("waiting for the command queue");
-        return 0;
-    }
+    // Modes 2 to 4 signal the game's queue; 5 never speaks to it, so it does not care whether the
+    // pass had one to give us.
+    const bool useQueue = mode >= 2 && mode <= 4;
 
-    // The fallback queue arrives as a void* OptiScaler keeps for its timing; ask it whether it really
-    // is a command queue before calling one. Signal on something that is not would jump through a
-    // vtable that isn't there, on the game's render thread, on the first frame.
+    if (useQueue)
     {
+        if (queue == nullptr)
+        {
+            // Without the queue there is no way to know when a copy has run, and reading a buffer the
+            // GPU may not have written yet would show the model a frame of noise.
+            Say("waiting for the command queue");
+            return 0;
+        }
+
+        // The fallback queue arrives as a void* OptiScaler keeps for its timing; ask it whether it
+        // really is a command queue before calling one. Signal on something that is not would jump
+        // through a vtable that isn't there, on the game's render thread, on the first frame.
         static ID3D12CommandQueue* vetted = nullptr;
 
         if (vetted != queue)
@@ -703,7 +779,8 @@ int Evaluate(ID3D12GraphicsCommandList* cmdList, ID3D12CommandQueue* queue, ID3D
         if (FAILED(modelInput->GetDevice(IID_PPV_ARGS(&device))) || device == nullptr)
             return 0;
 
-        const bool made = CreateStaging(device, desc);
+        Describe(device, queue, output, desc, mode);
+        const bool made = CreateStaging(device, desc, useQueue);
         device->Release();
 
         if (!made)
@@ -712,9 +789,15 @@ int Evaluate(ID3D12GraphicsCommandList* cmdList, ID3D12CommandQueue* queue, ID3D
         g.worker = std::thread(WorkerMain);
     }
 
-    // One tick per frame, ordered after everything already submitted. See Exchange::fence.
-    const UINT64 tick = ++g.tick;
-    queue->Signal(g.fence, tick);
+    if (mode == 1)
+        return 0; // the buffers exist, the worker is up, and nothing else happens. That is the test.
+
+    UINT64 tick = 0;
+
+    if (useQueue)
+        tick = ++g.tick; // one tick per frame, ordered after everything already submitted
+
+    const UINT64 frame = ++g.frame;
 
     if (reset)
     {
@@ -722,50 +805,65 @@ int Evaluate(ID3D12GraphicsCommandList* cmdList, ID3D12CommandQueue* queue, ID3D
         g.haveAnswer = false;
     }
 
+    const bool mayStage = mode >= 3;
+    const bool mayDeliver = mode >= 4;
     bool stage = false;
     bool deliver = false;
 
     {
         std::lock_guard<std::mutex> held(g.lock);
 
-        // A copy recorded last frame is on a list that has now been submitted, so this tick is when
-        // it will have run.
-        if (g.stage == Exchange::Stage::Recorded)
+        if (useQueue)
         {
-            g.stage = Exchange::Stage::Submitted;
-            g.readableAt = tick;
-            g.wake.notify_one();
+            // A copy recorded last frame is on a list that has now been submitted, so this tick is
+            // when it will have run.
+            if (g.stage == Exchange::Stage::Recorded)
+            {
+                g.stage = Exchange::Stage::Submitted;
+                g.readableAt = tick;
+                g.wake.notify_one();
+            }
+            else if (g.stage == Exchange::Stage::Ready && mayDeliver)
+            {
+                deliver = true;
+                g.stage = Exchange::Stage::Idle;
+                g.writableAt = tick + 1; // the copy below runs no later than the next tick
+                g.haveAnswer = true;
+            }
+            else if (g.stage == Exchange::Stage::Idle && mayStage)
+            {
+                stage = true;
+                g.stage = Exchange::Stage::Recorded;
+            }
         }
-        else if (g.stage == Exchange::Stage::Ready)
+        else
         {
-            deliver = true;
-            g.stage = Exchange::Stage::Idle;
-            g.writableAt = tick + 1; // the copy below runs no later than the next tick
-            g.haveAnswer = true;
-        }
-        else if (g.stage == Exchange::Stage::Idle)
-        {
-            stage = true;
-            g.stage = Exchange::Stage::Recorded;
+            // No fence to ask, so the frame counter answers instead: a copy recorded three frames ago
+            // has run, and a buffer the GPU was reading three frames ago is free.
+            if (g.stage == Exchange::Stage::Recorded && frame >= g.recordedAtFrame + kFrameLag)
+            {
+                g.stage = Exchange::Stage::Submitted;
+                g.wake.notify_one();
+            }
+            else if (g.stage == Exchange::Stage::Ready && mayDeliver)
+            {
+                deliver = true;
+                g.stage = Exchange::Stage::Idle;
+                g.haveAnswer = true;
+                g.deliveredAtFrame = frame;
+            }
+            else if (g.stage == Exchange::Stage::Idle && mayStage &&
+                     (g.deliveredAtFrame == 0 || frame >= g.deliveredAtFrame + kFrameLag))
+            {
+                stage = true;
+                g.stage = Exchange::Stage::Recorded;
+                g.recordedAtFrame = frame;
+            }
         }
     }
 
-    const int limit = StepLimit();
-
-    if (limit == 0)
-    {
-        std::lock_guard<std::mutex> held(g.lock);
-        g.stage = Exchange::Stage::Idle; // nothing recorded, so nothing is pending
-        return 0;
-    }
-
-    if (limit < 3)
-        deliver = false;
-
-    if (limit < 2)
-        stage = false;
-
-    const int reached = GuardedRecord(cmdList, queue, modelInput, output, tick, deliver ? 1 : 0, stage ? 1 : 0);
+    const int reached =
+        GuardedRecord(cmdList, queue, modelInput, output, tick, deliver ? 1 : 0, stage ? 1 : 0, useQueue ? 1 : 0);
 
     // The first frames, and then only when something changes: enough to see the exchange turn over
     // without writing a line per frame forever.
@@ -777,7 +875,8 @@ int Evaluate(ID3D12GraphicsCommandList* cmdList, ID3D12CommandQueue* queue, ID3D
         {
             saidFrames++;
             saidStep = reached;
-            LOG_DEBUG("DLSS-NR (HIP): tick {} deliver={} stage={} reached step {}", tick, deliver, stage, reached);
+            LOG_DEBUG("DLSS-NR (HIP): mode {} frame {} tick {} deliver={} stage={} reached step {}", mode, frame, tick,
+                      deliver, stage, reached);
         }
     }
 
