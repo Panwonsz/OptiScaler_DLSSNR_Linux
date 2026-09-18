@@ -9,18 +9,22 @@
 // composes the answer back, capture, frame hold, the menu -- is API-agnostic and runs unchanged. Only
 // the model itself cannot run through NGX on a Radeon, and that is the piece replaced here.
 //
-// The model is the same network, re-implemented in HIP for RDNA 3/4 and driven from the Linux side of
-// a Proton process:
+// The model is the same network, re-implemented in HIP for RDNA 3/4, and it runs outside the game:
 //
-//   libdlss5_hip.so   the network, loaded into the Wine process by LD_PRELOAD, running on the real
-//                     GPU through ROCm; it publishes a table of function pointers in the Unix
-//                     environment when it loads
-//   dlss5_hip.dll     a small PE trampoline that reads that table through Wine's live Unix
-//                     environment and calls into it; this is what the code here loads
+//   dlss5-nr-daemon   an ordinary Linux process on the host that loads the weights once and answers
+//                     frames on 127.0.0.1; started by dlss5-nr-run.sh before the game
+//   libdlss5_hip.so   the network itself, which that daemon loads -- with the system's own ROCm,
+//                     since nothing has to be smuggled into the Steam container any more
 //
-// The contract is deliberately narrow: packed float RGBA in, packed float RGB out, 1920x1080, which is
-// the size the network was built for. The caller therefore has to drive the pass at exactly that
-// working size -- see DlssNrHipModelWidth/Height.
+// It used to live in this process, loaded through a PE trampoline over a preloaded libdlss5_hip.so.
+// That cost us the GPU: Stellar Blade hit VK_ERROR_DEVICE_LOST two seconds into the first frame even
+// with the recording switched off entirely (DLSS5_NR_STEPS=0), so the model was doing it merely by
+// existing in the process. ROCm compute and vkd3d graphics do not share a Wine process well.
+//
+// The contract is unchanged and still deliberately narrow: one frame in, one frame out, 1920x1080,
+// which is the size the network was built for. The caller therefore has to drive the pass at exactly
+// that working size -- see ModelWidth/ModelHeight. What crosses the wire is the staged frame in its
+// own format; the daemon does the conversion.
 //
 // Cost, and what follows from it. The network takes roughly 230 ms per frame on a 7900 XT, which is
 // several frames of anybody's game, so the evaluate cannot be synchronous: the frame's proxy is copied
@@ -40,8 +44,9 @@ constexpr unsigned int ModelHeight = 1080;
 // Whether this backend is switched on. Reads the config; does not load anything.
 bool Enabled();
 
-// Loads dlss5_hip.dll and initialises the model. Safe to call every frame: it does the work once and
-// then answers from what happened. False means this backend is unavailable and Status() says why.
+// Connects to the daemon. Safe to call every frame: it does the work once and then answers from what
+// happened. False means this backend is unavailable and Status() says why -- most often that nothing
+// is listening, because the game was launched without dlss5-nr-run.sh.
 bool Ensure(ID3D12Device* device);
 
 // Records the frame's half of the exchange on the caller's command list and returns the NGX-shaped
@@ -60,8 +65,8 @@ bool Ensure(ID3D12Device* device);
 int Evaluate(ID3D12GraphicsCommandList* cmdList, ID3D12CommandQueue* queue, ID3D12Resource* modelInput,
              ID3D12Resource* output, unsigned int workWidth, unsigned int workHeight, bool reset);
 
-// Drops everything: the worker, the staging buffers, the model. Called on teardown and on a
-// resolution or format change.
+// Drops everything: the worker, the staging buffers, the connection. Called on teardown and on a
+// resolution or format change. The daemon keeps the weights loaded, so reconnecting is instant.
 void Release();
 
 // Why the backend is unavailable, or what it is doing. Never null.
