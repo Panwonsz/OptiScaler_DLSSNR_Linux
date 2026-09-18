@@ -32,10 +32,10 @@ namespace
 // 1920x1080, no encode and no composition. That is exactly the shape of the call this backend
 // replaces -- the pass hands the model a proxy it has already built and composes the answer itself.
 
-using PFN_Init = int(*)(const char* weightsDir, int gpu);
-using PFN_Run = int(*)(const float* rgba, float* rgb, unsigned int seed);
-using PFN_LastError = const char*(*)();
-using PFN_Shutdown = void(*)();
+using PFN_Init = int (*)(const char* weightsDir, int gpu);
+using PFN_Run = int (*)(const float* rgba, float* rgb, unsigned int seed);
+using PFN_LastError = const char* (*) ();
+using PFN_Shutdown = void (*)();
 
 constexpr size_t kPixels = size_t(ModelWidth) * size_t(ModelHeight);
 
@@ -124,8 +124,7 @@ uint16_t FloatToHalf(float f)
     // the field layout wants -- 0x3FF + 1 becomes the next exponent with a zero mantissa.
     const uint32_t packed = (uint32_t(exponent) << 10) | (mantissa >> 13);
     const uint32_t remainder = mantissa & 0x1FFFu;
-    const uint32_t rounded =
-        packed + ((remainder > 0x1000u || (remainder == 0x1000u && (packed & 1u) != 0)) ? 1u : 0u);
+    const uint32_t rounded = packed + ((remainder > 0x1000u || (remainder == 0x1000u && (packed & 1u) != 0)) ? 1u : 0u);
 
     // A carry out of the top saturates the same way the overflow case above does.
     return uint16_t(sign | (rounded >= 0x7C00u ? 0x7BFFu : rounded));
@@ -245,8 +244,7 @@ void DecodeRow(const uint8_t* src, float* dst, DXGI_FORMAT format, unsigned int 
     case DXGI_FORMAT_B8G8R8A8_UNORM:
     case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB:
     {
-        const bool bgr =
-            format == DXGI_FORMAT_B8G8R8A8_UNORM || format == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB;
+        const bool bgr = format == DXGI_FORMAT_B8G8R8A8_UNORM || format == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB;
 
         for (unsigned int x = 0; x < width; x++)
         {
@@ -335,8 +333,7 @@ void EncodeRow(const float* src, uint8_t* dst, DXGI_FORMAT format, unsigned int 
     case DXGI_FORMAT_B8G8R8A8_UNORM:
     case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB:
     {
-        const bool bgr =
-            format == DXGI_FORMAT_B8G8R8A8_UNORM || format == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB;
+        const bool bgr = format == DXGI_FORMAT_B8G8R8A8_UNORM || format == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB;
 
         for (unsigned int x = 0; x < width; x++)
         {
@@ -427,9 +424,9 @@ struct Exchange
     std::mutex lock;
     std::condition_variable wake;
     Stage stage = Stage::Idle;
-    UINT64 readableAt = 0;    // fence tick at which the staged proxy is readable
-    UINT64 writableAt = 0;    // fence tick after which the upload buffer may be rewritten
-    bool haveAnswer = false;  // the output texture holds a finished answer from some earlier frame
+    UINT64 readableAt = 0;   // fence tick at which the staged proxy is readable
+    UINT64 writableAt = 0;   // fence tick after which the upload buffer may be rewritten
+    bool haveAnswer = false; // the output texture holds a finished answer from some earlier frame
     bool quit = false;
     unsigned int seed = 0;
     float lastMs = 0.0f;
@@ -441,10 +438,10 @@ struct Exchange
 };
 
 Exchange g;
-std::mutex g_once;                        // serialises Ensure/Release against each other
-std::mutex g_statusLock;                  // the worker reports failures too, so this is its own lock
+std::mutex g_once;       // serialises Ensure/Release against each other
+std::mutex g_statusLock; // the worker reports failures too, so this is its own lock
 std::string g_status = "not started";
-std::atomic<bool> g_failed { false };     // sticky: a failed backend does not retry into a crash
+std::atomic<bool> g_failed { false }; // sticky: a failed backend does not retry into a crash
 
 // Deliberately does not take g_once: Release() holds that while joining the worker, and the worker
 // is one of the callers.
@@ -529,13 +526,12 @@ void WorkerMain()
         const auto rowPitch = size_t(g.footprint.Footprint.RowPitch);
 
         for (unsigned int y = 0; y < ModelHeight; y++)
-            DecodeRow(g.readbackMapped + y * rowPitch, g.input.data() + size_t(y) * ModelWidth * 4,
-                      g.format, ModelWidth);
+            DecodeRow(g.readbackMapped + y * rowPitch, g.input.data() + size_t(y) * ModelWidth * 4, g.format,
+                      ModelWidth);
 
         const auto started = std::chrono::steady_clock::now();
         const int result = g.run(g.input.data(), g.answer.data(), g.seed++);
-        const auto ms =
-            std::chrono::duration<float, std::milli>(std::chrono::steady_clock::now() - started).count();
+        const auto ms = std::chrono::duration<float, std::milli>(std::chrono::steady_clock::now() - started).count();
 
         if (result != 0)
         {
@@ -548,8 +544,8 @@ void WorkerMain()
 
         // Answer -> the frame's format, in the upload buffer the next frame copies from.
         for (unsigned int y = 0; y < ModelHeight; y++)
-            EncodeRow(g.answer.data() + size_t(y) * ModelWidth * 3, g.uploadMapped + y * rowPitch,
-                      g.format, ModelWidth);
+            EncodeRow(g.answer.data() + size_t(y) * ModelWidth * 3, g.uploadMapped + y * rowPitch, g.format,
+                      ModelWidth);
 
         {
             std::lock_guard<std::mutex> held(g.lock);
@@ -577,8 +573,7 @@ void Barrier(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* resource, D3D12
     cmdList->ResourceBarrier(1, &barrier);
 }
 
-void CopyTextureToBuffer(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* texture,
-                         ID3D12Resource* buffer)
+void CopyTextureToBuffer(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* texture, ID3D12Resource* buffer)
 {
     D3D12_TEXTURE_COPY_LOCATION src {};
     src.pResource = texture;
@@ -593,8 +588,7 @@ void CopyTextureToBuffer(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* tex
     cmdList->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
 }
 
-void CopyBufferToTexture(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* buffer,
-                         ID3D12Resource* texture)
+void CopyBufferToTexture(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* buffer, ID3D12Resource* texture)
 {
     D3D12_TEXTURE_COPY_LOCATION src {};
     src.pResource = buffer;
@@ -607,6 +601,74 @@ void CopyBufferToTexture(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* buf
     dst.SubresourceIndex = 0;
 
     cmdList->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+}
+
+// Whether this pointer answers like a command queue. Its own function because MSVC will not allow
+// __try in a function that has objects to unwind, and Evaluate is full of them.
+bool QueueLooksReal(ID3D12CommandQueue* queue)
+{
+    ID3D12CommandQueue* real = nullptr;
+    bool usable = false;
+
+    __try
+    {
+        usable = SUCCEEDED(queue->QueryInterface(IID_PPV_ARGS(&real))) && real != nullptr;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        usable = false;
+    }
+
+    if (real != nullptr)
+        real->Release();
+
+    return usable;
+}
+
+// Every D3D12 call this backend makes on the game's own command list, in one place, with no C++
+// object in scope so that structured exception handling is legal here.
+//
+// The first frame of this pass took the game down before its menu, and a crash inside a game's render
+// thread says nothing about which call did it. Now each step is numbered, the number reaches the log,
+// and an access violation disables the backend instead of ending the session: a bug of ours should
+// cost the player the feature, not their game.
+//
+// Returns the step it reached (1 signal, 2-4 deliver, 5-6 stage); negative means it faulted there.
+int GuardedRecord(ID3D12GraphicsCommandList* cmdList, ID3D12CommandQueue* queue, ID3D12Resource* modelInput,
+                  ID3D12Resource* output, unsigned long long tick, int deliver, int stage)
+{
+    int step = 0;
+
+    __try
+    {
+        step = 1;
+        queue->Signal(g.fence, tick);
+
+        if (deliver)
+        {
+            step = 2;
+            Barrier(cmdList, output, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_DEST);
+            step = 3;
+            CopyBufferToTexture(cmdList, g.upload, output);
+            step = 4;
+            Barrier(cmdList, output, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        }
+
+        if (stage)
+        {
+            step = 5;
+            Barrier(cmdList, modelInput, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+            CopyTextureToBuffer(cmdList, modelInput, g.readback);
+            Barrier(cmdList, modelInput, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+            step = 6;
+        }
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        return -step;
+    }
+
+    return step;
 }
 
 bool CreateStaging(ID3D12Device* device, const D3D12_RESOURCE_DESC& desc)
@@ -633,11 +695,9 @@ bool CreateStaging(ID3D12Device* device, const D3D12_RESOURCE_DESC& desc)
     uploadHeap.Type = D3D12_HEAP_TYPE_UPLOAD;
 
     if (FAILED(device->CreateCommittedResource(&readbackHeap, D3D12_HEAP_FLAG_NONE, &bufferDesc,
-                                               D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
-                                               IID_PPV_ARGS(&g.readback))) ||
+                                               D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&g.readback))) ||
         FAILED(device->CreateCommittedResource(&uploadHeap, D3D12_HEAP_FLAG_NONE, &bufferDesc,
-                                               D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
-                                               IID_PPV_ARGS(&g.upload))))
+                                               D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&g.upload))))
     {
         Fail("the staging buffers could not be allocated");
         return false;
@@ -750,8 +810,7 @@ bool Ensure(ID3D12Device* device)
     g.device = device;
     g.modelReady = true;
     Say("ready");
-    LOG_INFO("DLSS-NR (HIP): model initialised from {}, running at {}x{}", weights, ModelWidth,
-             ModelHeight);
+    LOG_INFO("DLSS-NR (HIP): model initialised from {}, running at {}x{}", weights, ModelWidth, ModelHeight);
     return true;
 }
 
@@ -773,6 +832,24 @@ int Evaluate(ID3D12GraphicsCommandList* cmdList, ID3D12CommandQueue* queue, ID3D
         // GPU may not have written yet would show the model a frame of noise.
         Say("waiting for the command queue");
         return 0;
+    }
+
+    // The fallback queue arrives as a void* OptiScaler keeps for its timing; ask it whether it really
+    // is a command queue before calling one. Signal on something that is not would jump through a
+    // vtable that isn't there, on the game's render thread, on the first frame.
+    {
+        static ID3D12CommandQueue* vetted = nullptr;
+
+        if (vetted != queue)
+        {
+            if (!QueueLooksReal(queue))
+            {
+                Fail("the command queue handed to the pass is not a usable ID3D12CommandQueue");
+                return 0;
+            }
+
+            vetted = queue;
+        }
     }
 
     const D3D12_RESOURCE_DESC desc = modelInput->GetDesc();
@@ -837,20 +914,31 @@ int Evaluate(ID3D12GraphicsCommandList* cmdList, ID3D12CommandQueue* queue, ID3D
         }
     }
 
-    if (deliver)
+    const int reached = GuardedRecord(cmdList, queue, modelInput, output, tick, deliver ? 1 : 0, stage ? 1 : 0);
+
+    // The first frames, and then only when something changes: enough to see the exchange turn over
+    // without writing a line per frame forever.
     {
-        Barrier(cmdList, output, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_DEST);
-        CopyBufferToTexture(cmdList, g.upload, output);
-        Barrier(cmdList, output, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        static int saidFrames = 0;
+        static int saidStep = 0;
+
+        if (saidFrames < 8 || saidStep != reached)
+        {
+            saidFrames++;
+            saidStep = reached;
+            LOG_DEBUG("DLSS-NR (HIP): tick {} deliver={} stage={} reached step {}", tick, deliver, stage, reached);
+        }
     }
 
-    if (stage)
+    if (reached < 0)
     {
-        Barrier(cmdList, modelInput, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-                D3D12_RESOURCE_STATE_COPY_SOURCE);
-        CopyTextureToBuffer(cmdList, modelInput, g.readback);
-        Barrier(cmdList, modelInput, D3D12_RESOURCE_STATE_COPY_SOURCE,
-                D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        {
+            std::lock_guard<std::mutex> held(g.lock);
+            g.stage = Exchange::Stage::Idle;
+        }
+
+        Fail("faulted while recording step " + std::to_string(-reached) + " (1 signal, 2-4 deliver, 5-6 stage)");
+        return 0;
     }
 
     std::lock_guard<std::mutex> held(g.lock);
