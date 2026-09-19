@@ -2105,6 +2105,13 @@ void DlssNr_Dx12::Dispatch(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* c
 
                 if (g_nr.heldColor != nullptr)
                 {
+                    // Named for the hang report. Frame hold crashes this game on the first click, and
+                    // the copy below is the suspect: it asserts the game's own output is in
+                    // UNORDERED_ACCESS, which held for FSR writing it directly but need not hold when
+                    // the output arrives through UpscalerBasePlugin. A barrier that names the wrong
+                    // before-state is precisely what cost us a night on Unreal.
+                    g_nr.heldColor->SetName(L"DLSS-NR heldColor");
+
                     Barrier(cmdList, target, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
                     Barrier(cmdList, g_nr.heldColor, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
                             D3D12_RESOURCE_STATE_COPY_DEST);
