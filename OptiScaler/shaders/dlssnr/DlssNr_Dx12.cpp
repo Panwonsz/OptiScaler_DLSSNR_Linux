@@ -239,6 +239,11 @@ struct NrState
     // composite (no aliased minify). nrScaler is the filter both were built with, so a changed
     // DlssNrScalingDownscaler rebuilds them.
     ID3D12Resource* outputNative = nullptr;
+
+    // The answer as it is being shown, which lags the newest answer by the blend. Held across frames on
+    // purpose: it is the thing that makes the detail layer continuous.
+    ID3D12Resource* answerHeld = nullptr;
+    bool answerHeldPrimed = false;
     OS_Dx12* superDown = nullptr;
     Scaler nrScaler = Scaler::Count;
 
@@ -1458,6 +1463,31 @@ float SteadyStaleness()
     return std::min(modelMs / frameMs, 120.0f);
 }
 
+// How much of the newest answer to take each frame. 0.15 reaches ~90% in fourteen frames, about one
+// delivery interval, so the layer is always moving toward the newest answer and never jumps to it.
+float BlendAlphaSetting()
+{
+    static float alpha = -1.0f;
+
+    if (alpha < 0.0f)
+    {
+        char value[32] {};
+        alpha = 0.15f;
+
+        if (GetEnvironmentVariableA("DLSS5_NR_BLEND", value, sizeof(value)) != 0 && value[0] != 0)
+        {
+            const float asked = (float) atof(value);
+
+            if (asked > 0.0f && asked <= 1.0f)
+                alpha = asked;
+        }
+
+        LOG_INFO("DLSS-NR: each new answer is blended in at {} per frame", alpha);
+    }
+
+    return alpha;
+}
+
 float ReprojectPixelSetting(const char* name, float fallback)
 {
     char value[32] {};
@@ -2669,10 +2699,68 @@ void DlssNr_Dx12::Dispatch(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* c
         ID3D12Resource* resolveProxy = superDownOk ? g_nr.colorCopy : modelInput;
         ID3D12Resource* resolveAnswer = superDownOk ? g_nr.outputNative : g_nr.output;
 
+        // Ramp the answer instead of letting the resolve read a layer that changes in one step every
+        // ~230 ms. The held copy matches whichever answer texture this path chose, so it follows the
+        // super-sampling branch without a second case to keep in agreement.
+        const D3D12_RESOURCE_DESC answerDesc = resolveAnswer->GetDesc();
+
+        if (g_nr.answerHeld != nullptr)
+        {
+            const D3D12_RESOURCE_DESC have = g_nr.answerHeld->GetDesc();
+
+            if (have.Width != answerDesc.Width || have.Height != answerDesc.Height ||
+                have.Format != answerDesc.Format)
+            {
+                // Parked, not released: the resolve two frames ago may still be reading it.
+                ParkNrResource(g_nr.answerHeld);
+                g_nr.answerHeldPrimed = false;
+            }
+        }
+
+        if (g_nr.answerHeld == nullptr)
+        {
+            g_nr.answerHeld = CreateScratch(device, answerDesc.Format, (unsigned int) answerDesc.Width,
+                                            (unsigned int) answerDesc.Height);
+            g_nr.answerHeldPrimed = false;
+
+            if (g_nr.answerHeld != nullptr)
+                g_nr.answerHeld->SetName(L"DLSS-NR answerHeld");
+        }
+
+        if (g_nr.answerHeld != nullptr)
+        {
+            DlssNrConstants blendParams {};
+            blendParams.Mode = DlssNrMode_Blend;
+            blendParams.Width = (unsigned int) answerDesc.Width;
+            blendParams.Height = (unsigned int) answerDesc.Height;
+
+            // Primed, not blended from black on the first frame. The composition reads the answer as a
+            // difference against the proxy, so an empty held texture is not a neutral starting point --
+            // it is a strongly negative edit, and the frame would darken for a dozen frames before
+            // recovering.
+            blendParams.BlendAlpha = g_nr.answerHeldPrimed ? BlendAlphaSetting() : 1.0f;
+            g_nr.answerHeldPrimed = true;
+
+            DispatchPass(cmdList, blendParams, resolveAnswer, nullptr, nullptr, nullptr, nullptr,
+                         g_nr.answerHeld, nullptr);
+
+            Barrier(cmdList, g_nr.answerHeld, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                    D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+
+            resolveAnswer = g_nr.answerHeld;
+        }
+
         DispatchPass(cmdList, resolveParams, resolveProxy, resolveAnswer, g_nr.hdrCopy, motionIn, exposureTex, target,
                      nullptr);
         Barrier(cmdList, g_nr.output, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
                 D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+
+        // Back to where it started, exactly as g_nr.output does: UAV between frames, NPSR only while
+        // the resolve is reading it. Mirroring the existing pattern rather than inventing a second one
+        // is deliberate -- this pass has already cost one GPU hang over resource state.
+        if (g_nr.answerHeld != nullptr)
+            Barrier(cmdList, g_nr.answerHeld, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
 
         if (superDownOk)
             Barrier(cmdList, g_nr.outputNative, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,

@@ -33,6 +33,7 @@ cbuffer Params : register(b0)
     uint  gReprojectMode;  // 0 off, 1 warp, 2 field view, 3 fade only, 4 capped warp + fade
     float gReprojectWarpPx;// how far a warp is trusted, in output pixels
     float gReprojectFadePx;// further movement over which the edit falls to nothing
+    float gBlendAlpha;     // how much of the newest answer to take, in the blend pass
 };
 
 // Bringing an impossible colour back into a possible one.
@@ -552,6 +553,24 @@ void CSMain(uint3 id : SV_DispatchThreadID)
 
     // Normalised, so the source may be any size relative to this dispatch.
     float2 uv = (float2(id.xy) + 0.5) / float2(gWidth, gHeight);
+
+    // The answer, ramped rather than swapped.
+    //
+    // Without this the composited detail layer is REPLACED wholesale every ~230 ms. Two consecutive
+    // answers agree closely on smooth content and disagree on fine detail, so a face shows nothing and
+    // a background of foliage or grain pops four times a second. Nothing about that depends on motion,
+    // which is why weighting by movement did not touch it.
+    //
+    // gSource is the newest answer, gTarget is the one already on screen, and reading a UAV that is
+    // also being written is well defined here because each thread touches exactly its own texel.
+    if (gMode == 5)
+    {
+        float3 fresh = gSource.SampleLevel(gLinear, uv, 0).rgb;
+        float3 held = gTarget[id.xy].rgb;
+
+        gTarget[id.xy] = float4(lerp(held, fresh, saturate(gBlendAlpha)), 1.0);
+        return;
+    }
 
     // The meter. One thread per tile of a 64x64 grid over the frame, writing that tile's mean
     // luminance. The frame is raw linear here -- this runs before the encode, on purpose, because the

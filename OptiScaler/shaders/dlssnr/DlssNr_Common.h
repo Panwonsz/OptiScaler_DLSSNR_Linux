@@ -20,7 +20,8 @@ enum DlssNrMode : uint32_t
     DlssNrMode_Resolve = 1,    // proxy + the model's answer + the untouched copy -> the edited frame
     DlssNrMode_Downsample = 2, // the proxy -> a smaller proxy, when the model works below full size
     DlssNrMode_Meter = 3,      // the exposure texture -> tile (0,0), for the white point
-    DlssNrMode_Calibrate = 4   // the untouched frame -> a grid of tile peak luminances
+    DlssNrMode_Calibrate = 4,  // the untouched frame -> a grid of tile peak luminances
+    DlssNrMode_Blend = 5       // the newest answer -> blended into the answer already on screen
 };
 
 // The meter's grid. 64 x 64 tiles over the whole frame, whatever its size.
@@ -198,6 +199,11 @@ struct alignas(256) DlssNrConstants
     // How many further pixels of movement take the edit from full strength to nothing. This is the part
     // that removes the ghosting -- not the warp.
     float ReprojectFadePx;
+
+    // How much of the newest answer to take each frame, for DlssNrMode_Blend. The answer is replaced
+    // outright every ~230 ms otherwise, and a step change in a high-frequency detail layer is a visible
+    // pop four times a second -- invisible on a face, obvious on foliage. 1 restores that behaviour.
+    float BlendAlpha;
 };
 
 class DlssNr_Common
