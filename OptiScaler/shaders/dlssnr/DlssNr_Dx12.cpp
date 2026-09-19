@@ -1230,9 +1230,36 @@ ID3D12Resource* ReadableGuide(ID3D12Device* device, ID3D12GraphicsCommandList* c
         LOG_DEBUG("DLSS-NR cloned a typeless guide as format {}", (int) TypedGuideFormat(source->GetDesc().Format));
     }
 
-    Barrier(cmdList, source, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_SOURCE);
-    cmdList->CopyResource(*clone, source);
-    Barrier(cmdList, source, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    // DLSS5_NR_GUIDES=0 allocates the clone and hands it over without copying anything into it. The
+    // model then reads an uninitialised depth or motion buffer, which is wrong but harmless -- and it
+    // is the only way to ask whether this CopyResource is what hangs the GPU.
+    //
+    // It is the prime suspect. A RADV hang report named the faulting pipeline as vkd3d's copy-image
+    // meta pipeline -- a fullscreen blit with a gl_FragDepth output and a multisample texture binding,
+    // which is exactly what a typeless-to-typed depth CopyResource compiles to -- and it faulted while
+    // reading an image that had already been destroyed. This is the only depth copy in the pass.
+    static int guides = -1;
+
+    if (guides < 0)
+    {
+        char value[16] {};
+        guides = 1;
+
+        if (GetEnvironmentVariableA("DLSS5_NR_GUIDES", value, sizeof(value)) != 0 && atoi(value) == 0)
+        {
+            guides = 0;
+            LOG_WARN("DLSS-NR: guide copies are switched off (DLSS5_NR_GUIDES=0). Depth and motion are "
+                     "uninitialised; this is a diagnostic, not a usable picture.");
+        }
+    }
+
+    if (guides != 0)
+    {
+        Barrier(cmdList, source, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        cmdList->CopyResource(*clone, source);
+        Barrier(cmdList, source, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    }
+
     Barrier(cmdList, *clone, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
     return *clone;
 }
