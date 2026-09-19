@@ -79,6 +79,12 @@ bool Failed();
 // resolution or format change. The daemon keeps the weights loaded, so reconnecting is instant.
 void Release();
 
+// How many frames old the answer currently in the output texture is. Zero when there is none.
+//
+// The composition needs this to reproject: the model's answer is a picture of the world as it was this
+// many frames ago, and laying it down unmoved is what smears.
+unsigned int FramesSinceAnswer();
+
 // Why the backend is unavailable, or what it is doing. Never null.
 const char* Status();
 

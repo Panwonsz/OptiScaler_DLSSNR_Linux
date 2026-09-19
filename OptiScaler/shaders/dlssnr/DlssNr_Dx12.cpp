@@ -1406,6 +1406,64 @@ struct ScopedNrStateEnvelope
 // pass does nothing at all and the log has no opinion about why.
 //
 // So each distinct reason is reported once. Once, not once per frame.
+// How far to warp the model's answer, from DLSS5_NR_REPROJECT.
+//
+//   unset / 0   off, exactly as every build before this one
+//   auto        the exchange's own measure of how stale its answer is
+//   view        draw the offset field instead of the picture, at that same measure
+//   <number>    a fixed count, negative to flip the vectors' sign
+//
+// A fixed number is here because the sign cannot be derived with any confidence: backward vectors are
+// the DLSS convention, RE Engine reports a negative Y scale, and what the two compose to is far easier
+// to see than to argue about. `view` answers it in one look.
+void ReprojectSetting(unsigned int staleFrames, float& frames, unsigned int& mode)
+{
+    static int parsed = -1;
+    static float fixed = 0.0f;
+
+    if (parsed < 0)
+    {
+        char value[32] {};
+        parsed = 0;
+
+        if (GetEnvironmentVariableA("DLSS5_NR_REPROJECT", value, sizeof(value)) != 0 && value[0] != 0)
+        {
+            const std::string asked(value);
+
+            if (asked == "auto")
+                parsed = 1;
+            else if (asked == "view")
+                parsed = 2;
+            else
+            {
+                fixed = (float) atof(value);
+                parsed = fixed != 0.0f ? 3 : 0;
+            }
+
+            LOG_INFO("DLSS-NR: reprojection set to '{}'", asked);
+        }
+    }
+
+    frames = 0.0f;
+    mode = 0;
+
+    if (parsed == 1)
+    {
+        frames = (float) staleFrames;
+        mode = frames != 0.0f ? 1u : 0u;
+    }
+    else if (parsed == 2)
+    {
+        frames = (float) staleFrames;
+        mode = 2;
+    }
+    else if (parsed == 3)
+    {
+        frames = fixed;
+        mode = 1;
+    }
+}
+
 void ReportSkipOnce(const char* reason)
 {
     static std::set<std::string> seen;
@@ -2268,6 +2326,18 @@ void DlssNr_Dx12::Dispatch(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* c
         depthIn = ReadableGuide(device, cmdList, depth, &g_nr.depthClone);
         motionIn = ReadableGuide(device, cmdList, motion, &g_nr.motionClone);
     }
+    else if (motion != nullptr && !IsTypeless(motion->GetDesc().Format))
+    {
+        // Motion vectors for the reprojection -- and only when they need no copy.
+        //
+        // The copy is what took the GPU down. ReadableGuide clones a TYPELESS guide into a typed one,
+        // and vkd3d implements that CopyResource as a fullscreen blit, which Unreal's render graph had
+        // already recycled the memory under. A typed resource is returned as-is, so this branch
+        // allocates nothing, records nothing, and reads no memory the game has handed away. Measured:
+        // RE Engine's vectors are R16G16_FLOAT and take this path; its depth is R24G8_TYPELESS and is
+        // still left alone, as is Unreal's. The model has no use for depth anyway.
+        motionIn = ReadableGuide(device, cmdList, motion, &g_nr.motionClone);
+    }
 
     if (!useHip && (depthIn == nullptr || motionIn == nullptr))
     {
@@ -2419,6 +2489,26 @@ void DlssNr_Dx12::Dispatch(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* c
         resolveParams.CompareSplit = cfg.DlssNrCompareSplit.value_or_default();
         resolveParams.CompareZoom = std::max(1.0f, cfg.DlssNrCompareZoom.value_or_default());
         resolveParams.CompareSwap = cfg.DlssNrCompareSwap.value_or_default() ? 1u : 0u;
+
+        // Declared in the struct and in the cbuffer from the beginning, and assigned nowhere in the
+        // tree until now -- so every dispatch ever made has read them as zero. The resolve works in uv,
+        // so the scale wanted is the one that turns the game's units into GUIDE pixels: multiplying by
+        // mvToWork as the evaluate call does would count the resolution ratio a second time.
+        resolveParams.MvScaleX = g_nr.guideMvScaleX;
+        resolveParams.MvScaleY = g_nr.guideMvScaleY;
+        resolveParams.GuideWidth = guideWidth;
+        resolveParams.GuideHeight = guideHeight;
+
+        // Only with something real bound to t3. DispatchPass substitutes the source picture for an
+        // absent motion texture, and warping the answer by colour would look like a broken model.
+        float reprojectFrames = 0.0f;
+        unsigned int reprojectMode = 0;
+
+        if (motionIn != nullptr)
+            ReprojectSetting(useHip ? DlssNr::Hip::FramesSinceAnswer() : 0u, reprojectFrames, reprojectMode);
+
+        resolveParams.ReprojectFrames = reprojectFrames;
+        resolveParams.ReprojectMode = reprojectMode;
 
         // The numbers the composition actually ran with, logged when any of them changes.
         //

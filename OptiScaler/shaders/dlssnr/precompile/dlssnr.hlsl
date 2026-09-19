@@ -29,6 +29,8 @@ cbuffer Params : register(b0)
     uint  gApplyModel;     // 0 output the clean frame (pass still runs), 1 apply the model's edit
     uint  gUseGameExposure;// D3D12 source-1 only: 1 = read the game's live exposure in-shader (t4)
     float gExposurePreMul; // preExposure * trim, so the live white point is gExposurePreMul / exposure
+    float gReprojectFrames;// how many frames of motion to warp the model's answer forward by
+    uint  gReprojectMode;  // 0 off, 1 warp, 2 draw the offset field
 };
 
 // Bringing an impossible colour back into a possible one.
@@ -279,11 +281,39 @@ float3 SrgbToLinear(float3 v)
     return lerp(v / 12.92, pow((v + 0.055) / 1.055, 2.4), step(0.04045, v));
 }
 
+// Where the model's answer for this pixel actually is.
+//
+// The answer is not this frame's. The network takes ~230 ms, which at 68 fps is sixteen frames, so what
+// comes back describes the scene as it was sixteen frames ago. Compositing it at the pixel it arrives at
+// lays a sixteen-frame-old detail layer over a current frame, and every moving edge gets a doubled copy
+// of itself. That is the ghosting -- never the model being wrong, just two moments added together.
+//
+// The motion vectors say where this pixel used to be, so the answer is read from where the pixel was
+// when the model saw it. One frame's motion times the answer's age assumes the camera moved at a
+// constant rate over those frames: true of a pan, false of a flick. Accumulating the field properly
+// needs its own pass and a ping-pong pair; this covers the case that actually smears.
+//
+// gMvScaleX/Y turn the game's units into guide pixels and the guide size turns those into uv. Nothing
+// here runs unless gReprojectMode says so, because the dispatch binds the SOURCE PICTURE to t3 when no
+// motion texture was supplied -- an unbound descriptor is not an empty read -- and warping by colour
+// would look like a broken model rather than an unbound slot.
+float2 ReprojectOffset(float2 uv)
+{
+    if (gReprojectMode == 0 || gReprojectFrames == 0.0)
+        return float2(0.0, 0.0);
+
+    float2 mv = gMotion.SampleLevel(gLinear, uv, 0).xy;
+    float2 px = float2(mv.x * gMvScaleX, mv.y * gMvScaleY);
+    float2 guide = float2(max(gGuideWidth, 1u), max(gGuideHeight, 1u));
+
+    return (px / guide) * gReprojectFrames;
+}
+
 // The edit at an arbitrary position, exactly as the resolve computes its own.
 float3 EditAt(float2 uvq)
 {
     float3 p = gSource.SampleLevel(gLinear, uvq, 0).rgb;
-    float3 m = gModel.SampleLevel(gLinear, uvq, 0).rgb;
+    float3 m = gModel.SampleLevel(gLinear, uvq + ReprojectOffset(uvq), 0).rgb;
 
     if (gPassthrough == 0)
     {
@@ -733,8 +763,24 @@ void CSMain(uint3 id : SV_DispatchThreadID)
 
     // Sampled rather than loaded: when the model ran at a reduced resolution these are smaller than the
     // frame, and its edit is enlarged here while the frame underneath stays untouched.
+    // The proxy is this frame's and stays where it is; only the model's answer is old and moves. The
+    // residual is then the model's edit of a scene point, taken against that point as it looks NOW,
+    // which is what it is about to be added to.
+    float2 reprojUv = cmpUv + ReprojectOffset(cmpUv);
+
+    // Mode 2 draws the field instead of the picture: red rightward, green downward, flat grey where the
+    // vectors are zero. A sign error shows up here as the colours running the wrong way under a pan,
+    // and the sign is the one thing that cannot be judged from the finished result -- a backwards warp
+    // smears in a way that looks a great deal like no warp at all.
+    if (gReprojectMode == 2)
+    {
+        float2 shown = (reprojUv - cmpUv) * float2(gWidth, gHeight);
+        gTarget[id.xy] = float4(0.5 + shown.x * 0.02, 0.5 + shown.y * 0.02, 0.5, 1.0) * gDebugScale;
+        return;
+    }
+
     float4 proxySample = gSource.SampleLevel(gLinear, cmpUv, 0);
-    float4 modelSample = gModel.SampleLevel(gLinear, cmpUv, 0);
+    float4 modelSample = gModel.SampleLevel(gLinear, reprojUv, 0);
 
     // Nothing was encoded on the way in, so nothing is decoded here either.
     float3 proxy = gPassthrough != 0 ? proxySample.rgb : SrgbToLinear(proxySample.rgb);

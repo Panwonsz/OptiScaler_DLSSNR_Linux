@@ -83,7 +83,7 @@ struct Response
 
 // Printed at init. Two builds in a row produced an identical failure, and nothing in the log said
 // whether the second one was the DLL actually being loaded.
-constexpr const char* kBuildMark = "2026-09-19g";
+constexpr const char* kBuildMark = "2026-09-19i";
 
 // ---------------------------------------------------------------------------------------------
 // Pixel conversion does not happen here any more.
@@ -166,6 +166,11 @@ struct Exchange
     UINT64 frame = 0;
     UINT64 recordedAtFrame = 0;
     UINT64 deliveredAtFrame = 0;
+
+    // Which frame the answer currently in `output` was made FROM -- not when it arrived. The difference
+    // is the whole point: the reprojection needs to know how far the world has moved since the model
+    // saw it, and that is measured from the frame that was staged, not the frame that took delivery.
+    UINT64 answerFromFrame = 0;
 
     bool quit = false;
     unsigned int seed = 0;
@@ -856,6 +861,10 @@ int Evaluate(ID3D12GraphicsCommandList* cmdList, ID3D12CommandQueue* queue, ID3D
                 g.stage = Exchange::Stage::Idle;
                 g.haveAnswer = true;
                 g.deliveredAtFrame = frame;
+
+                // The state machine is strictly serial, so nothing has been staged since this answer's
+                // own frame was: recordedAtFrame still names it.
+                g.answerFromFrame = g.recordedAtFrame;
             }
             else if (g.stage == Exchange::Stage::Idle && mayStage &&
                      (g.deliveredAtFrame == 0 || frame >= g.deliveredAtFrame + kFrameLag))
@@ -972,6 +981,21 @@ const char* Status()
 // The only thing that means "stop asking". Everything else Evaluate can answer is a frame that had
 // nothing to compose, which is not a fault and must not be latched.
 bool Failed() { return g_failed; }
+
+// How many frames have passed since the scene the current answer describes.
+//
+// Zero when there is no answer, and zero on the queue-driven modes, which never tracked the staged
+// frame -- mode 5 is the default and the only one in use, so that is a gap rather than a bug, but it is
+// a gap: a caller that gets 0 warps by nothing and composes exactly as it always did.
+unsigned int FramesSinceAnswer()
+{
+    std::lock_guard<std::mutex> held(g.lock);
+
+    if (!g.haveAnswer || g.answerFromFrame == 0 || g.frame <= g.answerFromFrame)
+        return 0;
+
+    return (unsigned int) (g.frame - g.answerFromFrame);
+}
 
 float LastModelMs()
 {

@@ -180,6 +180,15 @@ struct alignas(256) DlssNrConstants
     // preExposure * trim, so the live white point is ExposurePreMul / exposure. Mirrored in the cbuffer.
     uint32_t UseGameExposure;
     float ExposurePreMul;
+
+    // How far to warp the model's answer forward, in frames of motion. 0 leaves it where it landed,
+    // which is what every build before this one did. Negative flips the vectors' sign.
+    float ReprojectFrames;
+
+    // 0 off, 1 warp, 2 draw the offset field instead of the picture. Off unless the caller has real
+    // motion vectors bound: the dispatch substitutes the source PICTURE for an absent motion texture,
+    // so a shader reading t3 unconditionally would warp by colour.
+    uint32_t ReprojectMode;
 };
 
 class DlssNr_Common
