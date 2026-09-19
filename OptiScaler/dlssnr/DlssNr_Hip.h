@@ -61,9 +61,19 @@ bool Ensure(ID3D12Device* device);
 //
 // Success here means "the exchange is running", not "this frame's answer is in output": output
 // carries the most recent finished answer, which is some frames old. On the first frames there is no
-// answer yet and the call returns 0, which the pass already treats as "leave the frame alone".
+// answer yet and the call returns 0. The caller must read that as "leave this frame alone" and try
+// again -- NOT as a failure. It used to read it as a failure, which disabled the pass on frame one of
+// every session and made the whole backend look broken in every game but the one where the menu's
+// Retry button could be clicked three times to walk it through priming. See Failed() below.
 int Evaluate(ID3D12GraphicsCommandList* cmdList, ID3D12CommandQueue* queue, ID3D12Resource* modelInput,
              ID3D12Resource* output, unsigned int workWidth, unsigned int workHeight, bool reset);
+
+// Whether this backend has given up for the session.
+//
+// Evaluate returning 0 does not mean this. It means "output holds no answer this frame", which is the
+// normal state of the first three frames: one to stage, one to submit, one to receive. Only this
+// reports the exchange as actually broken, and only this should disable anything.
+bool Failed();
 
 // Drops everything: the worker, the staging buffers, the connection. Called on teardown and on a
 // resolution or format change. The daemon keeps the weights loaded, so reconnecting is instant.

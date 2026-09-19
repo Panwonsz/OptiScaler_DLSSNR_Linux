@@ -83,7 +83,7 @@ struct Response
 
 // Printed at init. Two builds in a row produced an identical failure, and nothing in the log said
 // whether the second one was the DLL actually being loaded.
-constexpr const char* kBuildMark = "2026-09-19f";
+constexpr const char* kBuildMark = "2026-09-19g";
 
 // ---------------------------------------------------------------------------------------------
 // Pixel conversion does not happen here any more.
@@ -968,6 +968,10 @@ const char* Status()
     }
     return mine.c_str();
 }
+
+// The only thing that means "stop asking". Everything else Evaluate can answer is a frame that had
+// nothing to compose, which is not a fault and must not be latched.
+bool Failed() { return g_failed; }
 
 float LastModelMs()
 {

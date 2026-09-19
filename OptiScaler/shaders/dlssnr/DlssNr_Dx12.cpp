@@ -2519,6 +2519,27 @@ void DlssNr_Dx12::Dispatch(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* c
                 g_captureWriteAtFrame = g_frames + 8;
         }
     }
+    else if (useHip && !DlssNr::Hip::Failed())
+    {
+        // Not a failure. The HIP exchange is asynchronous, so the first frames of a session have no
+        // answer to compose: three of them prime it -- stage one, submit it, take one back -- and until
+        // then Evaluate answers 0 because output is empty, exactly as its contract says.
+        //
+        // Latching that as fatal is what killed this path in every game. Frame one returned 0, the pass
+        // set failed and logged "disabling for this session", and the only way past it was the menu's
+        // Retry button, which grants one frame per click: three clicks and the answer had landed. That
+        // is why Stellar Blade appeared to work and Resident Evil 4 did not -- OptiScaler's Win32 input
+        // hook loses to REFramework there, so the button could not be reached. The games were never the
+        // variable.
+        static bool saidWaiting = false;
+
+        if (!saidWaiting)
+        {
+            saidWaiting = true;
+            LOG_INFO("DLSS-NR (HIP): the exchange is running but has no answer yet, so the frame passes "
+                     "through until it does");
+        }
+    }
     else
     {
         g_nr.failed = true;
