@@ -2231,10 +2231,24 @@ void DlssNr_Dx12::Dispatch(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* c
     // Read the exposure scan's candidates on the pass's own command list, once a frame.
     DlssNr::ExposureScan::Tick(device, cmdList);
 
-    ID3D12Resource* depthIn = ReadableGuide(device, cmdList, depth, &g_nr.depthClone);
-    ID3D12Resource* motionIn = ReadableGuide(device, cmdList, motion, &g_nr.motionClone);
+    // The HIP backend never sees the guides. dlss5_run takes packed colour in and packed colour out --
+    // no depth, no motion vectors -- so preparing them for it is work with no consumer.
+    //
+    // That is not merely wasteful, it is the crash. Preparing a typeless guide means CopyResource into
+    // a typed clone, and on this game that copy hangs the GPU: a RADV hang report names vkd3d's
+    // copy-image meta pipeline faulting on an image that had already been destroyed. Skipping the
+    // copies is what let the pass run on a Radeon for the first time. Restore them the moment the
+    // model learns to use them.
+    ID3D12Resource* depthIn = nullptr;
+    ID3D12Resource* motionIn = nullptr;
 
-    if (depthIn == nullptr || motionIn == nullptr)
+    if (!useHip)
+    {
+        depthIn = ReadableGuide(device, cmdList, depth, &g_nr.depthClone);
+        motionIn = ReadableGuide(device, cmdList, motion, &g_nr.motionClone);
+    }
+
+    if (!useHip && (depthIn == nullptr || motionIn == nullptr))
     {
         g_nr.failed = true;
         g_nr.reason = "the game's depth or motion vectors could not be made readable";

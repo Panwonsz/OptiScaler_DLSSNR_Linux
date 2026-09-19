@@ -83,7 +83,7 @@ struct Response
 
 // Printed at init. Two builds in a row produced an identical failure, and nothing in the log said
 // whether the second one was the DLL actually being loaded.
-constexpr const char* kBuildMark = "2026-09-19c";
+constexpr const char* kBuildMark = "2026-09-19d";
 
 // ---------------------------------------------------------------------------------------------
 // Pixel conversion does not happen here any more.
