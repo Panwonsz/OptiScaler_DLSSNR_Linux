@@ -348,7 +348,10 @@ float ReprojectConfidence(float2 uv)
     if (gReprojectMode < 3 || gReprojectFadePx <= 0.0)
         return 1.0;
 
-    return saturate(1.0 - (length(ReprojectPixels(uv)) - gReprojectWarpPx) / gReprojectFadePx);
+    // smoothstep, not a linear ramp. A linear fade has a corner at each end, and a corner sweeps
+    // across the picture as the camera turns -- which reads as a moving edge even when everything
+    // either side of it is right.
+    return 1.0 - smoothstep(0.0, gReprojectFadePx, length(ReprojectPixels(uv)) - gReprojectWarpPx);
 }
 
 // The edit at an arbitrary position, exactly as the resolve computes its own.

@@ -1,5 +1,6 @@
 #include "pch.h"
 
+#include <chrono>
 #include <set>
 
 #include <dlssnr/DlssNr.h>
@@ -1416,6 +1417,47 @@ struct ScopedNrStateEnvelope
 // A fixed number is here because the sign cannot be derived with any confidence: backward vectors are
 // the DLSS convention, RE Engine reports a negative Y scale, and what the two compose to is far easier
 // to see than to argue about. `view` answers it in one look.
+// How many frames of motion separate the answer from now, as a steady number.
+//
+// NOT the instantaneous age. FramesSinceAnswer() is exact and useless here: an answer lands about every
+// sixteen frames, so the age ramps 4 -> 20 and snaps back, four times a second. Multiplying a warp
+// distance or a fade weight by that produces a 4 Hz pulse -- the flicker in `fade` and the sliding in
+// `auto` were the same sawtooth seen two ways.
+//
+// What actually decides the gap is the model's latency, which is steady at ~230 ms, over the frame
+// time. Both are smooth, so the ratio is smooth, and no frame cares where in the delivery cycle it
+// happens to fall.
+float SteadyStaleness()
+{
+    static std::chrono::steady_clock::time_point last {};
+    static float frameMs = 0.0f;
+
+    const auto now = std::chrono::steady_clock::now();
+
+    if (last.time_since_epoch().count() != 0)
+    {
+        const float delta =
+            std::chrono::duration_cast<std::chrono::duration<float, std::milli>>(now - last).count();
+
+        // Smoothed, and with obvious nonsense rejected: a loading screen or an alt-tab produces a
+        // single enormous delta that would otherwise take a hundred frames to decay out of the average.
+        if (delta > 0.1f && delta < 200.0f)
+            frameMs = frameMs == 0.0f ? delta : frameMs * 0.95f + delta * 0.05f;
+    }
+
+    last = now;
+
+    const float modelMs = DlssNr::Hip::LastModelMs();
+
+    if (modelMs <= 0.0f || frameMs <= 0.0f)
+        return 0.0f;
+
+    // The exchange holds an answer for its own latency and then a few frames more while the next one is
+    // staged and submitted, which is the kFrameLag margin on the other side. Close enough at this
+    // precision: the fade is a soft ramp, not a threshold that has to be exact.
+    return std::min(modelMs / frameMs, 120.0f);
+}
+
 float ReprojectPixelSetting(const char* name, float fallback)
 {
     char value[32] {};
@@ -1426,7 +1468,7 @@ float ReprojectPixelSetting(const char* name, float fallback)
     return fallback;
 }
 
-void ReprojectSetting(unsigned int staleFrames, float& frames, unsigned int& mode, float& warpPx,
+void ReprojectSetting(float staleFrames, float& frames, unsigned int& mode, float& warpPx,
                       float& fadePx)
 {
     // 0 off, 2 the field view, 3 fade only, 4 capped warp + fade, 1 the uncapped warp kept only so the
@@ -1479,7 +1521,7 @@ void ReprojectSetting(unsigned int staleFrames, float& frames, unsigned int& mod
     if (chosen == 0)
         return;
 
-    frames = chosen == 5 ? fixedFrames : (float) staleFrames;
+    frames = chosen == 5 ? fixedFrames : staleFrames;
 
     if (frames == 0.0f && chosen != 2)
         return;
@@ -1488,12 +1530,13 @@ void ReprojectSetting(unsigned int staleFrames, float& frames, unsigned int& mod
 
     // The worst staleness seen, once per new worst. Bounded, and it turns "it looked unstable" into a
     // number -- which is precisely what the previous round of this was missing.
-    static unsigned int worst = 0;
+    static float worst = 0.0f;
 
-    if (staleFrames > worst)
+    if (staleFrames > worst + 1.0f)
     {
         worst = staleFrames;
-        LOG_INFO("DLSS-NR: the answer is now up to {} frames old", worst);
+        LOG_INFO("DLSS-NR: the answer trails the frame by {:.1f} frames ({:.1f} ms model)", worst,
+                 DlssNr::Hip::LastModelMs());
     }
 }
 
@@ -2541,7 +2584,7 @@ void DlssNr_Dx12::Dispatch(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* c
         float reprojectFadePx = 0.0f;
 
         if (motionIn != nullptr)
-            ReprojectSetting(useHip ? DlssNr::Hip::FramesSinceAnswer() : 0u, reprojectFrames, reprojectMode,
+            ReprojectSetting(useHip ? SteadyStaleness() : 0.0f, reprojectFrames, reprojectMode,
                              reprojectWarpPx, reprojectFadePx);
 
         resolveParams.ReprojectFrames = reprojectFrames;
