@@ -1900,6 +1900,20 @@ void DlssNr_Dx12::Dispatch(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* c
             RecordBuiltTuning(cfg);
             LOG_INFO("DLSS-NR (HIP) running at {}x{}, model {}x{}, guides {}x{}", width, height, workWidth, workHeight,
                      guideWidth, guideHeight);
+
+            // The guides' formats, once, because they decide whether this game could ever have motion
+            // reprojection. A typeless guide must be cloned with CopyResource to be readable, and on
+            // Unreal that copy reads memory the render graph has already given to something else --
+            // the use-after-free that hung the GPU, and why the HIP path skips the guides. A game whose
+            // depth and motion arrive already typed needs no copy, so its vectors could be read
+            // directly and the stale answer warped onto the current frame.
+            const D3D12_RESOURCE_DESC depthDesc = depth != nullptr ? depth->GetDesc() : D3D12_RESOURCE_DESC {};
+            const D3D12_RESOURCE_DESC motionDesc = motion != nullptr ? motion->GetDesc() : D3D12_RESOURCE_DESC {};
+            LOG_INFO("DLSS-NR (HIP) guides: depth fmt {} {} {}x{} | motion fmt {} {} {}x{}", (int) depthDesc.Format,
+                     IsTypeless(depthDesc.Format) ? "TYPELESS (needs a copy)" : "typed (usable directly)",
+                     (unsigned) depthDesc.Width, (unsigned) depthDesc.Height, (int) motionDesc.Format,
+                     IsTypeless(motionDesc.Format) ? "TYPELESS (needs a copy)" : "typed (usable directly)",
+                     (unsigned) motionDesc.Width, (unsigned) motionDesc.Height);
         }
     }
     else if (g_nr.feature == nullptr)
