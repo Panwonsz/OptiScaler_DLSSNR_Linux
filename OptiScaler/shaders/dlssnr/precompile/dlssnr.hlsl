@@ -30,7 +30,9 @@ cbuffer Params : register(b0)
     uint  gUseGameExposure;// D3D12 source-1 only: 1 = read the game's live exposure in-shader (t4)
     float gExposurePreMul; // preExposure * trim, so the live white point is gExposurePreMul / exposure
     float gReprojectFrames;// how many frames of motion to warp the model's answer forward by
-    uint  gReprojectMode;  // 0 off, 1 warp, 2 draw the offset field
+    uint  gReprojectMode;  // 0 off, 1 warp, 2 field view, 3 fade only, 4 capped warp + fade
+    float gReprojectWarpPx;// how far a warp is trusted, in output pixels
+    float gReprojectFadePx;// further movement over which the edit falls to nothing
 };
 
 // Bringing an impossible colour back into a possible one.
@@ -297,7 +299,14 @@ float3 SrgbToLinear(float3 v)
 // here runs unless gReprojectMode says so, because the dispatch binds the SOURCE PICTURE to t3 when no
 // motion texture was supplied -- an unbound descriptor is not an empty read -- and warping by colour
 // would look like a broken model rather than an unbound slot.
-float2 ReprojectOffset(float2 uv)
+// How far this pixel has moved since the model saw the scene, in pixels of the output.
+//
+// gMvScaleX/Y turn the game's units into guide pixels and the guide size turns those into uv, which the
+// output size then turns into output pixels. RE4R reports 640 x -360 against a 640x360 guide, so its
+// vectors are already uv and a brisk pan is 1-3% of the screen per frame -- times sixteen frames of
+// staleness, a quarter to a half of the screen. Worth knowing in pixels rather than in uv, because
+// "0.3" reads as small and 576 px does not.
+float2 ReprojectPixels(float2 uv)
 {
     if (gReprojectMode == 0 || gReprojectFrames == 0.0)
         return float2(0.0, 0.0);
@@ -306,7 +315,40 @@ float2 ReprojectOffset(float2 uv)
     float2 px = float2(mv.x * gMvScaleX, mv.y * gMvScaleY);
     float2 guide = float2(max(gGuideWidth, 1u), max(gGuideHeight, 1u));
 
-    return (px / guide) * gReprojectFrames;
+    return (px / guide) * float2(gWidth, gHeight) * gReprojectFrames;
+}
+
+// Where to read the answer: the same direction, but only as far as a warp can be believed.
+//
+// The uncapped version threw the picture across the screen, and it was right to: one frame's field
+// extrapolated sixteen frames is correct only under uniform motion, and every object, rotation and
+// parallax multiplies its own error by that same sixteen. A few pixels is reliable and fixes mild
+// ghosting; past that the answer is faded instead, because declining to add a stale picture is always
+// correct and guessing where it went is not.
+float2 ReprojectOffset(float2 uv)
+{
+    float2 px = ReprojectPixels(uv);
+    float len = length(px);
+
+    if (len <= 1e-6 || gReprojectWarpPx <= 0.0)
+        return float2(0.0, 0.0);
+
+    return (px / len) * min(len, gReprojectWarpPx) / float2(max(gWidth, 1u), max(gHeight, 1u));
+}
+
+// How much of the model's edit to keep: 1 where the pixel has not moved since the answer was made,
+// falling to 0 where it has moved further than that answer could still describe.
+//
+// This is what removes the ghosting. A sixteen-frame-old detail layer laid over a moving edge is two
+// moments added together, and the doubled edge is the sum, not a defect of the model. Photo mode looked
+// correct because this weight was 1 across the whole frame; the same idea, per pixel and continuous,
+// costs nothing and never invents anything.
+float ReprojectConfidence(float2 uv)
+{
+    if (gReprojectMode < 3 || gReprojectFadePx <= 0.0)
+        return 1.0;
+
+    return saturate(1.0 - (length(ReprojectPixels(uv)) - gReprojectWarpPx) / gReprojectFadePx);
 }
 
 // The edit at an arbitrary position, exactly as the resolve computes its own.
@@ -772,10 +814,20 @@ void CSMain(uint3 id : SV_DispatchThreadID)
     // vectors are zero. A sign error shows up here as the colours running the wrong way under a pan,
     // and the sign is the one thing that cannot be judged from the finished result -- a backwards warp
     // smears in a way that looks a great deal like no warp at all.
+    // Mode 2 draws the field. The first version of this scaled the offset directly at 0.02 per pixel,
+    // which clips above about 25 px -- and the real offsets were in the hundreds, so it showed nothing
+    // but saturated colour and taught nothing. Direction is normalised here, so it is readable whatever
+    // the magnitude: red is rightward, green is downward, and a pan should run with the camera. Blue
+    // carries the confidence, so the weight that actually governs the picture is visible in the same
+    // view -- bright where the edit lands in full, dark where it is being declined.
     if (gReprojectMode == 2)
     {
-        float2 shown = (reprojUv - cmpUv) * float2(gWidth, gHeight);
-        gTarget[id.xy] = float4(0.5 + shown.x * 0.02, 0.5 + shown.y * 0.02, 0.5, 1.0) * gDebugScale;
+        float2 px = ReprojectPixels(cmpUv);
+        float len = length(px);
+        float2 dir = len > 1e-6 ? px / len : float2(0.0, 0.0);
+        float weight = saturate(1.0 - (len - gReprojectWarpPx) / max(gReprojectFadePx, 1e-6));
+
+        gTarget[id.xy] = float4(0.5 + 0.5 * dir.x, 0.5 + 0.5 * dir.y, weight, 1.0) * gDebugScale;
         return;
     }
 
@@ -785,6 +837,14 @@ void CSMain(uint3 id : SV_DispatchThreadID)
     // Nothing was encoded on the way in, so nothing is decoded here either.
     float3 proxy = gPassthrough != 0 ? proxySample.rgb : SrgbToLinear(proxySample.rgb);
     float3 model = gPassthrough != 0 ? modelSample.rgb : SrgbToLinear(modelSample.rgb);
+
+    // Weight the answer toward the proxy by how stale it is for THIS pixel. Applied here, before
+    // anything downstream reads `model`, so one line covers the composed path, the matched residual and
+    // the replace decode alike -- rather than three places that have to be kept in agreement.
+    //
+    // At weight 0 the model contributes exactly nothing and the frame comes through as the upscaler made
+    // it, which is the correct answer for a pixel that has moved half the screen since the model saw it.
+    model = lerp(proxy, model, ReprojectConfidence(cmpUv));
 
     // The model's own answer, kept before the matched-residual block below can rewrite `model`, so the
     // replace decode uses what the model returned rather than the residual reconstruction.

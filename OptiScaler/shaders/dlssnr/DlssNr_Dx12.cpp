@@ -1416,51 +1416,84 @@ struct ScopedNrStateEnvelope
 // A fixed number is here because the sign cannot be derived with any confidence: backward vectors are
 // the DLSS convention, RE Engine reports a negative Y scale, and what the two compose to is far easier
 // to see than to argue about. `view` answers it in one look.
-void ReprojectSetting(unsigned int staleFrames, float& frames, unsigned int& mode)
+float ReprojectPixelSetting(const char* name, float fallback)
 {
-    static int parsed = -1;
-    static float fixed = 0.0f;
+    char value[32] {};
 
-    if (parsed < 0)
+    if (GetEnvironmentVariableA(name, value, sizeof(value)) != 0 && value[0] != 0)
+        return (float) atof(value);
+
+    return fallback;
+}
+
+void ReprojectSetting(unsigned int staleFrames, float& frames, unsigned int& mode, float& warpPx,
+                      float& fadePx)
+{
+    // 0 off, 2 the field view, 3 fade only, 4 capped warp + fade, 1 the uncapped warp kept only so the
+    // two can be compared. The default recommendation is 4: the warp handles the few pixels it can be
+    // trusted for and the fade handles everything else.
+    static int chosen = -1;
+    static float fixedFrames = 0.0f;
+    static float warp = 4.0f;
+    static float fade = 12.0f;
+
+    if (chosen < 0)
     {
         char value[32] {};
-        parsed = 0;
+        chosen = 0;
 
         if (GetEnvironmentVariableA("DLSS5_NR_REPROJECT", value, sizeof(value)) != 0 && value[0] != 0)
         {
             const std::string asked(value);
 
             if (asked == "auto")
-                parsed = 1;
+                chosen = 4;
             else if (asked == "view")
-                parsed = 2;
+                chosen = 2;
+            else if (asked == "fade")
+                chosen = 3;
+            else if (asked == "warp")
+                chosen = 1;
+            else if (asked == "off" || asked == "0")
+                chosen = 0;
             else
             {
-                fixed = (float) atof(value);
-                parsed = fixed != 0.0f ? 3 : 0;
+                fixedFrames = (float) atof(value);
+                chosen = fixedFrames != 0.0f ? 5 : 0;
             }
 
-            LOG_INFO("DLSS-NR: reprojection set to '{}'", asked);
+            warp = ReprojectPixelSetting("DLSS5_NR_WARP_PX", warp);
+            fade = ReprojectPixelSetting("DLSS5_NR_FADE_PX", fade);
+
+            LOG_INFO("DLSS-NR: reprojection '{}' -- warp trusted to {} px, edit fades out over the next "
+                     "{} px of movement",
+                     asked, warp, fade);
         }
     }
 
     frames = 0.0f;
     mode = 0;
+    warpPx = warp;
+    fadePx = fade;
 
-    if (parsed == 1)
+    if (chosen == 0)
+        return;
+
+    frames = chosen == 5 ? fixedFrames : (float) staleFrames;
+
+    if (frames == 0.0f && chosen != 2)
+        return;
+
+    mode = chosen == 5 ? 4u : (unsigned int) chosen;
+
+    // The worst staleness seen, once per new worst. Bounded, and it turns "it looked unstable" into a
+    // number -- which is precisely what the previous round of this was missing.
+    static unsigned int worst = 0;
+
+    if (staleFrames > worst)
     {
-        frames = (float) staleFrames;
-        mode = frames != 0.0f ? 1u : 0u;
-    }
-    else if (parsed == 2)
-    {
-        frames = (float) staleFrames;
-        mode = 2;
-    }
-    else if (parsed == 3)
-    {
-        frames = fixed;
-        mode = 1;
+        worst = staleFrames;
+        LOG_INFO("DLSS-NR: the answer is now up to {} frames old", worst);
     }
 }
 
@@ -2504,11 +2537,17 @@ void DlssNr_Dx12::Dispatch(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* c
         float reprojectFrames = 0.0f;
         unsigned int reprojectMode = 0;
 
+        float reprojectWarpPx = 0.0f;
+        float reprojectFadePx = 0.0f;
+
         if (motionIn != nullptr)
-            ReprojectSetting(useHip ? DlssNr::Hip::FramesSinceAnswer() : 0u, reprojectFrames, reprojectMode);
+            ReprojectSetting(useHip ? DlssNr::Hip::FramesSinceAnswer() : 0u, reprojectFrames, reprojectMode,
+                             reprojectWarpPx, reprojectFadePx);
 
         resolveParams.ReprojectFrames = reprojectFrames;
         resolveParams.ReprojectMode = reprojectMode;
+        resolveParams.ReprojectWarpPx = reprojectWarpPx;
+        resolveParams.ReprojectFadePx = reprojectFadePx;
 
         // The numbers the composition actually ran with, logged when any of them changes.
         //

@@ -189,6 +189,15 @@ struct alignas(256) DlssNrConstants
     // motion vectors bound: the dispatch substitutes the source PICTURE for an absent motion texture,
     // so a shader reading t3 unconditionally would warp by colour.
     uint32_t ReprojectMode;
+
+    // How far a warp is trusted, in pixels of the output. Beyond this the edit is faded rather than
+    // moved: a displacement built from one frame's vectors times sixteen is only right where motion is
+    // uniform, and past a few pixels it is inventing geometry.
+    float ReprojectWarpPx;
+
+    // How many further pixels of movement take the edit from full strength to nothing. This is the part
+    // that removes the ghosting -- not the warp.
+    float ReprojectFadePx;
 };
 
 class DlssNr_Common
