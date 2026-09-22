@@ -83,7 +83,7 @@ struct Response
 
 // Printed at init. Two builds in a row produced an identical failure, and nothing in the log said
 // whether the second one was the DLL actually being loaded.
-constexpr const char* kBuildMark = "2026-09-19l";
+constexpr const char* kBuildMark = "2026-09-22a";
 
 // ---------------------------------------------------------------------------------------------
 // Pixel conversion does not happen here any more.
@@ -188,6 +188,12 @@ std::mutex g_once;       // serialises Ensure/Release against each other
 std::mutex g_statusLock; // the worker reports failures too, so this is its own lock
 std::string g_status = "not started";
 std::atomic<bool> g_failed { false }; // sticky: a failed backend does not retry into a crash
+
+// What the last Evaluate did, for StagedLastFrame/DeliveredLastFrame. Atomics rather than members of
+// g because they are read without g.lock by a caller that is already on the render thread -- the same
+// thread that wrote them, one call earlier in the same function.
+std::atomic<bool> g_stagedLast { false };
+std::atomic<bool> g_deliveredLast { false };
 
 // Deliberately does not take g_once: Release() holds that while joining the worker, and the worker
 // is one of the callers.
@@ -757,6 +763,11 @@ bool Ensure(ID3D12Device* device)
 int Evaluate(ID3D12GraphicsCommandList* cmdList, ID3D12CommandQueue* queue, ID3D12Resource* modelInput,
              ID3D12Resource* output, unsigned int workWidth, unsigned int workHeight, bool reset)
 {
+    // Cleared here rather than at each return: Evaluate leaves by eight different paths and a caller
+    // reading "staged" from two frames ago would zero its accumulator in the wrong place.
+    g_stagedLast = false;
+    g_deliveredLast = false;
+
     if (g_failed || cmdList == nullptr || modelInput == nullptr || output == nullptr)
         return 0;
 
@@ -935,6 +946,9 @@ int Evaluate(ID3D12GraphicsCommandList* cmdList, ID3D12CommandQueue* queue, ID3D
         return 0;
     }
 
+    g_stagedLast = stage;
+    g_deliveredLast = deliver;
+
     std::lock_guard<std::mutex> held(g.lock);
     return g.haveAnswer ? 1 : 0;
 }
@@ -1032,6 +1046,10 @@ float LastModelMs()
     std::lock_guard<std::mutex> held(g.lock);
     return g.lastMs;
 }
+
+bool StagedLastFrame() { return g_stagedLast.load(); }
+
+bool DeliveredLastFrame() { return g_deliveredLast.load(); }
 
 float LastAnswerIntervalMs()
 {

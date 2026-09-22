@@ -100,6 +100,19 @@ const char* Status();
 // model's cost as the answer's age and undercounted by 2.5x.
 float LastAnswerIntervalMs();
 
+// What the most recent Evaluate did on the game's list, for a caller that has to keep its own
+// per-frame state in step with the exchange.
+//
+// StagedLastFrame() is the one that matters and the one that is easy to get wrong: the answer
+// describes the scene as it was when the proxy was STAGED, not when it was delivered, so anything
+// measuring how far the world has moved since must start counting there. Delivery is ~15 frames
+// later, which is most of the displacement.
+//
+// Both are false on a frame that did neither, including every frame the backend is disabled,
+// priming, or has failed on -- so a caller may read them unconditionally.
+bool StagedLastFrame();
+bool DeliveredLastFrame();
+
 // Milliseconds the model took on its last completed frame, for the menu's timing table. Zero until
 // one has completed.
 float LastModelMs();

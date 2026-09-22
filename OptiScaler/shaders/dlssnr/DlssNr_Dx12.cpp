@@ -228,6 +228,18 @@ struct NrState
     // The frame shrunk for the model, when it is working below full resolution.
     ID3D12Resource* colorSmall = nullptr;
 
+    // The accumulated displacement fields. [which answer][ping-pong], at guide resolution.
+    //
+    // accumOnScreen indexes the one belonging to the answer currently composited; the other belongs
+    // to the answer in flight. They swap on delivery. Each is a pair because the accumulate pass
+    // reads its source at a displaced position, which is not safe in place.
+    ID3D12Resource* accum[2][2] = {};
+    unsigned int accumPing[2] = { 0, 0 };
+    unsigned int accumOnScreen = 0;
+    bool accumPrimed[2] = { false, false };
+    unsigned int accumWidth = 0;
+    unsigned int accumHeight = 0;
+
     // Supersampling (working scale > 1): the Output Scaling upsampler used to enlarge the proxy to the
     // model's larger-than-native working size with a real filter instead of the box minifier. Created
     // lazily on the first super-native frame, released in Shutdown; sizes from the resources each call,
@@ -1435,6 +1447,28 @@ struct ScopedNrStateEnvelope
 // Defined below; SteadyStaleness needs it to account for the blend's own lag.
 float BlendAlphaSetting();
 
+// Whether to integrate the motion fields instead of extrapolating one of them.
+//
+// Off by default, and off means not one line of the existing path changes: nothing is allocated,
+// nothing is dispatched, and the resolve binds the motion texture at t3 exactly as it always has.
+// That is the same arrangement DLSS5_W16 shipped under and it exists for the same reason -- so the
+// comparison is one variable.
+bool AccumEnabled()
+{
+    static int on = -1;
+
+    if (on < 0)
+    {
+        char value[16] {};
+        on = 0;
+
+        if (GetEnvironmentVariableA("DLSS5_NR_ACCUM", value, sizeof(value)) != 0)
+            on = (value[0] != 0 && !(value[0] == '0' && value[1] == 0)) ? 1 : 0;
+    }
+
+    return on != 0;
+}
+
 float SteadyStaleness()
 {
     static std::chrono::steady_clock::time_point last {};
@@ -1965,6 +1999,14 @@ void DlssNr_Dx12::Dispatch(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* c
             ParkNrResource(g_nr.hdrCopy);
             ParkNrResource(g_nr.colorSmall);
             ParkNrResource(g_nr.outputNative);
+
+            for (auto& pair : g_nr.accum)
+                for (ID3D12Resource*& res : pair)
+                    ParkNrResource(res);
+
+            g_nr.accumWidth = 0;
+            g_nr.accumHeight = 0;
+            g_nr.accumPrimed[0] = g_nr.accumPrimed[1] = false;
         }
     }
 
@@ -1992,6 +2034,57 @@ void DlssNr_Dx12::Dispatch(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* c
 
         if (g_nr.colorSmall != nullptr)
             g_nr.colorSmall->SetName(L"DLSS-NR colorSmall");
+    }
+
+    // The displacement fields, at the guide's resolution because that is where the motion vectors
+    // are: resampling them to frame size first would cost sixteen times the work to carry no more
+    // information. Recreated when the guide changes size, which the scratch textures above do not
+    // have to care about because they follow the frame.
+    if (AccumEnabled() && (g_nr.accumWidth != guideWidth || g_nr.accumHeight != guideHeight))
+    {
+        for (auto& pair : g_nr.accum)
+            for (ID3D12Resource*& res : pair)
+                ParkNrResource(res);
+
+        g_nr.accumPrimed[0] = g_nr.accumPrimed[1] = false;
+        g_nr.accumWidth = 0;
+        g_nr.accumHeight = 0;
+
+        if (guideWidth > 0 && guideHeight > 0)
+        {
+            bool made = true;
+
+            for (unsigned int which = 0; which < 2; ++which)
+            {
+                for (unsigned int ping = 0; ping < 2; ++ping)
+                {
+                    g_nr.accum[which][ping] =
+                        CreateScratch(device, DXGI_FORMAT_R32G32B32A32_FLOAT, guideWidth, guideHeight);
+
+                    if (g_nr.accum[which][ping] == nullptr)
+                        made = false;
+                    else
+                        g_nr.accum[which][ping]->SetName(which == 0 ? L"DLSS-NR accum 0" : L"DLSS-NR accum 1");
+                }
+            }
+
+            if (made)
+            {
+                g_nr.accumWidth = guideWidth;
+                g_nr.accumHeight = guideHeight;
+                LOG_INFO("DLSS-NR: motion accumulation on, {}x{} x4", guideWidth, guideHeight);
+            }
+            else
+            {
+                // Half a set is worse than none: the resolve would bind a null and DispatchPass would
+                // substitute the source picture, warping the answer by colour.
+                for (auto& pair : g_nr.accum)
+                    for (ID3D12Resource*& res : pair)
+                        ParkNrResource(res);
+
+                LOG_WARN("DLSS-NR: the accumulation fields could not be allocated; staying on the old path");
+            }
+        }
     }
 
     // The down-leg target is native (the answer is brought back to frame size before the resolve).
@@ -2606,6 +2699,62 @@ void DlssNr_Dx12::Dispatch(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* c
                   cfg.DlssNrStyle.value_or_default());
     }
 
+    // Integrate one frame of motion into each live field.
+    //
+    // Both, every frame, and this is the part that cannot be economised: the field belonging to the
+    // answer in flight is useless unless it has been accumulating since that answer was staged, and
+    // that is fifteen frames before anyone looks at it. A chain with holes is not an integration.
+    ID3D12Resource* accumForResolve = nullptr;
+
+    if (AccumEnabled() && useHip && motionIn != nullptr && g_nr.accumWidth == guideWidth &&
+        g_nr.accumHeight == guideHeight && g_nr.accum[0][0] != nullptr)
+    {
+        // Delivery swaps the roles: what was in flight is now what is on screen.
+        if (DlssNr::Hip::DeliveredLastFrame())
+            g_nr.accumOnScreen ^= 1u;
+
+        const unsigned int inFlight = g_nr.accumOnScreen ^ 1u;
+        const bool staged = DlssNr::Hip::StagedLastFrame();
+
+        for (unsigned int which = 0; which < 2; ++which)
+        {
+            // The staging frame zeroes the incoming field rather than stepping it. The answer
+            // describes the scene at that instant, so its displacement starts at nothing; writing
+            // this frame's vectors instead would leave the field one frame ahead of the answer for
+            // the whole of its life.
+            const bool reset = (which == inFlight && staged) || !g_nr.accumPrimed[which];
+
+            ID3D12Resource* const src = g_nr.accum[which][g_nr.accumPing[which]];
+            ID3D12Resource* const dst = g_nr.accum[which][g_nr.accumPing[which] ^ 1u];
+
+            DlssNrConstants accumParams {};
+            accumParams.Mode = DlssNrMode_Accumulate;
+            accumParams.Width = guideWidth;
+            accumParams.Height = guideHeight;
+            accumParams.GuideWidth = guideWidth;
+            accumParams.GuideHeight = guideHeight;
+            accumParams.MvScaleX = g_nr.guideMvScaleX;
+            accumParams.MvScaleY = g_nr.guideMvScaleY;
+            accumParams.AccumReset = reset ? 1u : 0u;
+
+            // Same shape as the answerHeld transitions below: UAV between frames, shader resource
+            // only while something is reading it. Mirroring the existing pattern rather than
+            // inventing a second one, because this pass has already cost one device over exactly this.
+            Barrier(cmdList, src, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                    D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+
+            DispatchPass(cmdList, accumParams, src, nullptr, nullptr, motionIn, nullptr, dst, nullptr);
+
+            Barrier(cmdList, src, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+
+            g_nr.accumPing[which] ^= 1u;
+            g_nr.accumPrimed[which] = true;
+        }
+
+        accumForResolve = g_nr.accum[g_nr.accumOnScreen][g_nr.accumPing[g_nr.accumOnScreen]];
+    }
+
     if (result == NVSDK_NGX_Result_Success)
     {
         // Resolve takes the difference between what the model returned and what it was shown, and adds
@@ -2652,6 +2801,12 @@ void DlssNr_Dx12::Dispatch(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* c
         if (motionIn != nullptr)
             ReprojectSetting(useHip ? SteadyStaleness() : 0.0f, reprojectFrames, reprojectMode,
                              reprojectWarpPx, reprojectFadePx);
+
+        // With the field bound, ReprojectFrames stops being consulted at all -- the displacement has
+        // been measured rather than derived from a staleness estimate, so there is nothing to
+        // multiply by. It is still filled in, because the field view prints it and because a build
+        // with the accumulation off must behave exactly as before.
+        resolveParams.ReprojectAccum = accumForResolve != nullptr ? 1u : 0u;
 
         resolveParams.ReprojectFrames = reprojectFrames;
         resolveParams.ReprojectMode = reprojectMode;
@@ -2786,8 +2941,23 @@ void DlssNr_Dx12::Dispatch(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* c
             resolveAnswer = g_nr.answerHeld;
         }
 
-        DispatchPass(cmdList, resolveParams, resolveProxy, resolveAnswer, g_nr.hdrCopy, motionIn, exposureTex, target,
-                     nullptr);
+        // t3 carries the accumulated field when there is one, and the game's motion vectors when
+        // there is not. ReprojectPixels is the only thing in the resolve that reads t3, so this one
+        // substitution moves the offset, the confidence AND the field view onto the measured
+        // displacement together -- which is why the field view stays an instrument rather than
+        // quietly continuing to plot the quantity that is no longer used.
+        ID3D12Resource* const reprojectSource = accumForResolve != nullptr ? accumForResolve : motionIn;
+
+        if (accumForResolve != nullptr)
+            Barrier(cmdList, accumForResolve, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                    D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+
+        DispatchPass(cmdList, resolveParams, resolveProxy, resolveAnswer, g_nr.hdrCopy, reprojectSource, exposureTex,
+                     target, nullptr);
+
+        if (accumForResolve != nullptr)
+            Barrier(cmdList, accumForResolve, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
         Barrier(cmdList, g_nr.output, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
                 D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
 
