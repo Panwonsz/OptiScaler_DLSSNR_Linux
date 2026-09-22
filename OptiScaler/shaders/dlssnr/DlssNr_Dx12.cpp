@@ -1484,6 +1484,32 @@ float MvScaleMultiplier()
     return mul;
 }
 
+// Where the fade starts, if it is not to follow the warp cap. Negative means it follows.
+float TrustPxSetting()
+{
+    static float px = -2.0f;
+
+    if (px < -1.0f)
+    {
+        char value[32] {};
+        px = -1.0f;
+
+        if (GetEnvironmentVariableA("DLSS5_NR_TRUST_PX", value, sizeof(value)) != 0)
+        {
+            const double asked = atof(value);
+
+            if (asked >= 0.0 && asked < 100000.0)
+                px = (float) asked;
+        }
+
+        if (px >= 0.0f)
+            LOG_INFO("DLSS-NR: the fade starts at {:.1f} px, independent of the warp cap "
+                     "(DLSS5_NR_TRUST_PX)", px);
+    }
+
+    return px;
+}
+
 bool AccumEnabled()
 {
     static int on = -1;
@@ -2843,6 +2869,7 @@ void DlssNr_Dx12::Dispatch(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* c
         resolveParams.ReprojectMode = reprojectMode;
         resolveParams.ReprojectWarpPx = reprojectWarpPx;
         resolveParams.ReprojectFadePx = reprojectFadePx;
+        resolveParams.ReprojectTrustPx = TrustPxSetting();
 
         // The numbers the composition actually ran with, logged when any of them changes.
         //

@@ -36,6 +36,7 @@ cbuffer Params : register(b0)
     float gBlendAlpha;     // how much of the newest answer to take, in the blend pass
     uint  gReprojectAccum; // resolve: 1 = t3 is the accumulated field in guide uv, not motion
     uint  gAccumReset;     // accumulate: 1 = write zero, for the frame the answer is staged
+    float gReprojectTrustPx;// where the fade starts; negative = follow gReprojectWarpPx
 };
 
 // Bringing an impossible colour back into a possible one.
@@ -364,7 +365,12 @@ float ReprojectConfidence(float2 uv)
     // smoothstep, not a linear ramp. A linear fade has a corner at each end, and a corner sweeps
     // across the picture as the camera turns -- which reads as a moving edge even when everything
     // either side of it is right.
-    return 1.0 - smoothstep(0.0, gReprojectFadePx, length(ReprojectPixels(uv)) - gReprojectWarpPx);
+    // The fade's threshold, which is gReprojectWarpPx only because it used to have no choice.
+    // Keeping them separate is what lets the warp be uncapped without the fade being switched off
+    // as a side effect -- the confound that made every reading of a large warp uninterpretable.
+    const float trust = gReprojectTrustPx >= 0.0 ? gReprojectTrustPx : gReprojectWarpPx;
+
+    return 1.0 - smoothstep(0.0, gReprojectFadePx, length(ReprojectPixels(uv)) - trust);
 }
 
 // The edit at an arbitrary position, exactly as the resolve computes its own.

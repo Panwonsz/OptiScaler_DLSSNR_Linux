@@ -220,6 +220,14 @@ struct alignas(256) DlssNrConstants
     // Writing this frame's vectors instead would put the field one frame ahead of the answer for the
     // whole of its life.
     uint32_t AccumReset;
+
+    // Where the fade starts, in output pixels -- the second job ReprojectWarpPx used to do.
+    //
+    // Negative means "use ReprojectWarpPx", which is exactly the old behaviour and is the default,
+    // so a build that never sets this behaves identically to one without it. Set, the warp can run
+    // uncapped (placing the edit where the motion field says it went) while the fade keeps a
+    // threshold of its own. Those are different questions and they were one number.
+    float ReprojectTrustPx;
 };
 
 // A constant buffer view's size must be a multiple of 256, and the struct is padded to exactly that.
