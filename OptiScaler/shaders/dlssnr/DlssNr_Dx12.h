@@ -42,7 +42,11 @@
 // have left six frames, spending exactly the headroom the previous note set aside. Forty-eight
 // restores eight frames at five dispatches. If a sixth is ever added, raise this with it rather than
 // spending the margin again.
-#define DLSSNR_NUM_OF_HEAPS 48
+// Seven dispatches now: meter, encode, downsample, resolve, calibrate, and two accumulate passes
+// -- one for the answer on screen and one for the answer in flight, which need separate fields
+// because each measures displacement from its own staging frame. Fifty-six keeps the eight frames of
+// coverage the forty-eight was chosen to give at five.
+#define DLSSNR_NUM_OF_HEAPS 56
 
 class DlssNr_Dx12 : public Shader_Dx12, public DlssNr_Common
 {

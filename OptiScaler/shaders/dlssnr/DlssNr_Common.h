@@ -21,7 +21,8 @@ enum DlssNrMode : uint32_t
     DlssNrMode_Downsample = 2, // the proxy -> a smaller proxy, when the model works below full size
     DlssNrMode_Meter = 3,      // the exposure texture -> tile (0,0), for the white point
     DlssNrMode_Calibrate = 4,  // the untouched frame -> a grid of tile peak luminances
-    DlssNrMode_Blend = 5       // the newest answer -> blended into the answer already on screen
+    DlssNrMode_Blend = 5,      // the newest answer -> blended into the answer already on screen
+    DlssNrMode_Accumulate = 6  // motion + the accumulated field -> the accumulated field, one frame on
 };
 
 // The meter's grid. 64 x 64 tiles over the whole frame, whatever its size.
@@ -204,7 +205,27 @@ struct alignas(256) DlssNrConstants
     // outright every ~230 ms otherwise, and a step change in a high-frequency detail layer is a visible
     // pop four times a second -- invisible on a face, obvious on foliage. 1 restores that behaviour.
     float BlendAlpha;
+
+    // Whether t3 carries the ACCUMULATED displacement field instead of the game's motion vectors.
+    //
+    // Read by the resolve. 0 keeps the old behaviour exactly -- t3 is the motion texture and the
+    // displacement is one frame's vectors times ReprojectFrames. 1 means t3 is the field maintained
+    // by DlssNrMode_Accumulate, in guide uv, and ReprojectFrames is not consulted at all: the
+    // displacement has been measured rather than extrapolated, so there is no staleness to multiply
+    // by and no uniform-motion assumption left to violate.
+    uint32_t ReprojectAccum;
+
+    // Accumulate only. 1 writes zero instead of accumulating, which is what the staging frame wants:
+    // the answer describes the scene as it is at that instant, so its displacement starts at nothing.
+    // Writing this frame's vectors instead would put the field one frame ahead of the answer for the
+    // whole of its life.
+    uint32_t AccumReset;
 };
+
+// A constant buffer view's size must be a multiple of 256, and the struct is padded to exactly that.
+// Two fields were added above; this is here so that a third that does not fit fails the build rather
+// than the device.
+static_assert(sizeof(DlssNrConstants) <= 256, "DlssNrConstants no longer fits its 256-byte view");
 
 class DlssNr_Common
 {

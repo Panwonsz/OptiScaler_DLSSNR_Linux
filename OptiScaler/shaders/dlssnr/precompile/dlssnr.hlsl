@@ -34,6 +34,8 @@ cbuffer Params : register(b0)
     float gReprojectWarpPx;// how far a warp is trusted, in output pixels
     float gReprojectFadePx;// further movement over which the edit falls to nothing
     float gBlendAlpha;     // how much of the newest answer to take, in the blend pass
+    uint  gReprojectAccum; // resolve: 1 = t3 is the accumulated field in guide uv, not motion
+    uint  gAccumReset;     // accumulate: 1 = write zero, for the frame the answer is staged
 };
 
 // Bringing an impossible colour back into a possible one.
@@ -309,7 +311,17 @@ float3 SrgbToLinear(float3 v)
 // "0.3" reads as small and 576 px does not.
 float2 ReprojectPixels(float2 uv)
 {
-    if (gReprojectMode == 0 || gReprojectFrames == 0.0)
+    if (gReprojectMode == 0)
+        return float2(0.0, 0.0);
+
+    // The measured path. t3 holds the integrated field in guide uv, zeroed on the frame the answer
+    // was staged and composed with one motion field per frame since. It is already the total
+    // displacement, so there is nothing to multiply by: gReprojectFrames does not appear, and
+    // neither does the uniform-motion assumption that made the old line wrong on anything but a pan.
+    if (gReprojectAccum != 0)
+        return gMotion.SampleLevel(gLinear, uv, 0).xy * float2(gWidth, gHeight);
+
+    if (gReprojectFrames == 0.0)
         return float2(0.0, 0.0);
 
     float2 mv = gMotion.SampleLevel(gLinear, uv, 0).xy;
@@ -630,6 +642,45 @@ void CSMain(uint3 id : SV_DispatchThreadID)
         }
 
         gTarget[id.xy] = float4(peak, 0.0, 0.0, 1.0);
+        return;
+    }
+
+    // Integrate one more frame of motion into the displacement field.
+    //
+    //     acc_new(p) = mv(p) + acc_old(p + mv(p))
+    //
+    // The game's vectors point current -> previous, so p + mv(p) is where this pixel was last frame,
+    // and reading acc_old THERE is what chains the fields along the path the scene took rather than
+    // along a straight line. Everything is in guide uv: the vectors are converted once here, and the
+    // resolve turns uv into output pixels, so no scale is applied twice.
+    //
+    // t0 is acc_old, t3 is the motion texture, u0 is acc_new. Separate source and target because the
+    // read is at a displaced position and in-place would be a race.
+    if (gMode == 6)
+    {
+        if (id.x >= gWidth || id.y >= gHeight)
+            return;
+
+        if (gAccumReset != 0)
+        {
+            gTarget[id.xy] = float4(0.0, 0.0, 0.0, 0.0);
+            return;
+        }
+
+        const float2 guide = float2(max(gGuideWidth, 1u), max(gGuideHeight, 1u));
+        const float2 uv = (float2(id.xy) + 0.5) / guide;
+
+        const float2 mv = gMotion.SampleLevel(gLinear, uv, 0).xy;
+        const float2 step = float2(mv.x * gMvScaleX, mv.y * gMvScaleY) / guide;
+
+        // Outside the frame there is no history to chain, so the step stands alone. Clamping instead
+        // would smear the edge inward, which is the artefact this whole pass exists to remove.
+        const float2 back = uv + step;
+        const float2 prior = (back.x < 0.0 || back.x > 1.0 || back.y < 0.0 || back.y > 1.0)
+                                 ? float2(0.0, 0.0)
+                                 : gSource.SampleLevel(gLinear, back, 0).xy;
+
+        gTarget[id.xy] = float4(step + prior, 0.0, 0.0);
         return;
     }
 
