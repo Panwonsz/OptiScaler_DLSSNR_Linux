@@ -1432,6 +1432,9 @@ struct ScopedNrStateEnvelope
 // What actually decides the gap is the model's latency, which is steady at ~230 ms, over the frame
 // time. Both are smooth, so the ratio is smooth, and no frame cares where in the delivery cycle it
 // happens to fall.
+// Defined below; SteadyStaleness needs it to account for the blend's own lag.
+float BlendAlphaSetting();
+
 float SteadyStaleness()
 {
     static std::chrono::steady_clock::time_point last {};
@@ -1457,10 +1460,40 @@ float SteadyStaleness()
     if (modelMs <= 0.0f || frameMs <= 0.0f)
         return 0.0f;
 
-    // The exchange holds an answer for its own latency and then a few frames more while the next one is
-    // staged and submitted, which is the kFrameLag margin on the other side. Close enough at this
-    // precision: the fade is a soft ramp, not a threshold that has to be exact.
-    return std::min(modelMs / frameMs, 120.0f);
+    // What the answer's age actually is, rather than what the model cost. Three terms, and only the
+    // first of them used to be here:
+    //
+    //   modelMs        the round trip -- staged, sent, computed, received
+    //   held           it is then kept until the next answer lands, so averaged over the time it is
+    //                  on screen it is half a delivery interval older again
+    //   blend          DlssNrMode_Blend eases the layer toward each new answer at BlendAlpha per
+    //                  frame rather than swapping it, which is a first-order lag of (1-a)/a frames
+    //
+    // The comment this replaces called the gap "a few frames" and "close enough". Measured on a
+    // 7900 XT it was 12.1 frames reported against about 30 actual -- 2.5x -- and it was wrong in the
+    // one direction that matters. Every consumer of gReprojectFrames scales linearly with this, so
+    // undercounting it makes the fade believe a pixel has moved less than it has, and the fade then
+    // ADDS a stale edit where it should have declined one. The ghosting that was being blamed on the
+    // model's latency was partly this.
+    //
+    // Deliberately not exact. It is the mean age of what is on screen, which is the right statistic
+    // for a soft ramp; the instantaneous age is the sawtooth FramesSinceAnswer() was abandoned for.
+    const float intervalMs = DlssNr::Hip::LastAnswerIntervalMs();
+
+    // Before two answers have landed there is no interval to read. The exchange is serial, so the
+    // interval can never be shorter than the model's own cost -- that is the floor, not zero.
+    const float heldMs = 0.5f * (intervalMs > modelMs ? intervalMs : modelMs);
+
+    float alpha = BlendAlphaSetting();
+
+    if (!(alpha > 0.01f))
+        alpha = 0.01f;
+    else if (alpha > 1.0f)
+        alpha = 1.0f;
+
+    const float blendFrames = (1.0f - alpha) / alpha;
+
+    return std::min((modelMs + heldMs) / frameMs + blendFrames, 120.0f);
 }
 
 // How much of the newest answer to take each frame. 0.15 reaches ~90% in fourteen frames, about one
@@ -1540,6 +1573,9 @@ void ReprojectSetting(float staleFrames, float& frames, unsigned int& mode, floa
             LOG_INFO("DLSS-NR: reprojection '{}' -- warp trusted to {} px, edit fades out over the next "
                      "{} px of movement",
                      asked, warp, fade);
+            LOG_INFO("DLSS-NR: staleness is the answer's MEAN AGE on screen (round trip + half a "
+                     "delivery interval + the blend's lag), not the model's cost -- the latter "
+                     "undercounted it 2.5x and left the fade too permissive");
         }
     }
 

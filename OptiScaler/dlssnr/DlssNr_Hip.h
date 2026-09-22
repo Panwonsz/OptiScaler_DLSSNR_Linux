@@ -88,6 +88,18 @@ unsigned int FramesSinceAnswer();
 // Why the backend is unavailable, or what it is doing. Never null.
 const char* Status();
 
+// The wall-clock gap between the last two answers, smoothed. Zero until two have landed.
+//
+// This is not the same number as LastModelMs(), and the difference is the point. The model's round
+// trip is how long one answer takes to make; the interval is how long each one is ON SCREEN, because
+// the exchange is serial -- it stages, waits, delivers, waits, stages again -- and the delivered
+// answer stays in the output texture until the next replaces it. A consumer that wants the age of
+// what it is looking at needs modelMs + interval/2, not modelMs.
+//
+// SteadyStaleness() in the composition pass wanted exactly this and did not have it, so it used the
+// model's cost as the answer's age and undercounted by 2.5x.
+float LastAnswerIntervalMs();
+
 // Milliseconds the model took on its last completed frame, for the menu's timing table. Zero until
 // one has completed.
 float LastModelMs();

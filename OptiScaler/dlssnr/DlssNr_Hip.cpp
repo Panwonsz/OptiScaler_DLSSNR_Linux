@@ -172,6 +172,11 @@ struct Exchange
     // saw it, and that is measured from the frame that was staged, not the frame that took delivery.
     UINT64 answerFromFrame = 0;
 
+    // When the last answer was delivered, and the smoothed gap between deliveries. Distinct from
+    // lastMs, which is how long one answer took to make: this is how long each one is on screen.
+    std::chrono::steady_clock::time_point lastDelivery {};
+    float answerIntervalMs = 0.0f;
+
     bool quit = false;
     unsigned int seed = 0;
     float lastMs = 0.0f;
@@ -612,6 +617,29 @@ bool CreateStaging(ID3D12Device* device, const D3D12_RESOURCE_DESC& desc, bool n
     return true;
 }
 
+// The gap between deliveries, smoothed. Called from Evaluate with g.lock held.
+//
+// Recorded on every delivery in both clock regimes, so the number does not silently become zero if
+// the queue-driven modes are ever used again.
+void NoteDeliveryLocked()
+{
+    const auto now = std::chrono::steady_clock::now();
+
+    if (g.lastDelivery.time_since_epoch().count() != 0)
+    {
+        const float gap = std::chrono::duration<float, std::milli>(now - g.lastDelivery).count();
+
+        // A gap of seconds is a load screen, an alt-tab or a menu, not a delivery interval. Rejected
+        // rather than smoothed in, for the same reason the frame-time average rejects its outliers:
+        // one of them takes a hundred deliveries to decay back out.
+        if (gap > 1.0f && gap < 2000.0f)
+            g.answerIntervalMs =
+                g.answerIntervalMs == 0.0f ? gap : g.answerIntervalMs * 0.8f + gap * 0.2f;
+    }
+
+    g.lastDelivery = now;
+}
+
 } // namespace
 
 // What this backend is allowed to do, from DLSS5_NR_MODE. Each mode is a strict superset of the one
@@ -839,6 +867,7 @@ int Evaluate(ID3D12GraphicsCommandList* cmdList, ID3D12CommandQueue* queue, ID3D
                 g.stage = Exchange::Stage::Idle;
                 g.writableAt = tick + 1; // the copy below runs no later than the next tick
                 g.haveAnswer = true;
+                NoteDeliveryLocked();
             }
             else if (g.stage == Exchange::Stage::Idle && mayStage)
             {
@@ -865,6 +894,7 @@ int Evaluate(ID3D12GraphicsCommandList* cmdList, ID3D12CommandQueue* queue, ID3D
                 // The state machine is strictly serial, so nothing has been staged since this answer's
                 // own frame was: recordedAtFrame still names it.
                 g.answerFromFrame = g.recordedAtFrame;
+                NoteDeliveryLocked();
             }
             else if (g.stage == Exchange::Stage::Idle && mayStage &&
                      (g.deliveredAtFrame == 0 || frame >= g.deliveredAtFrame + kFrameLag))
@@ -1001,6 +1031,12 @@ float LastModelMs()
 {
     std::lock_guard<std::mutex> held(g.lock);
     return g.lastMs;
+}
+
+float LastAnswerIntervalMs()
+{
+    std::lock_guard<std::mutex> held(g.lock);
+    return g.answerIntervalMs;
 }
 
 } // namespace Hip
