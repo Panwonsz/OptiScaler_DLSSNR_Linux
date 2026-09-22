@@ -1453,6 +1453,37 @@ float BlendAlphaSetting();
 // nothing is dispatched, and the resolve binds the motion texture at t3 exactly as it always has.
 // That is the same arrangement DLSS5_W16 shipped under and it exists for the same reason -- so the
 // comparison is one variable.
+// A multiplier on the reported motion-vector scale, for settling what its units are.
+//
+// 1.0 changes nothing. The value is applied identically to the resolve and the accumulate pass,
+// because the one thing that must not happen is the two disagreeing -- a field integrated at one
+// scale and consumed at another is wrong in a way that looks like a warp bug.
+float MvScaleMultiplier()
+{
+    static float mul = -1.0f;
+
+    if (mul < 0.0f)
+    {
+        char value[32] {};
+        mul = 1.0f;
+
+        if (GetEnvironmentVariableA("DLSS5_NR_MV_MUL", value, sizeof(value)) != 0)
+        {
+            const double asked = atof(value);
+
+            // A zero or a negative would silently disable the reprojection and read as "the warp
+            // does nothing", which is the most misleading possible outcome for a probe.
+            if (asked > 0.01 && asked < 100.0)
+                mul = (float) asked;
+        }
+
+        if (mul != 1.0f)
+            LOG_INFO("DLSS-NR: motion vector scale multiplied by {:.3f} (DLSS5_NR_MV_MUL)", mul);
+    }
+
+    return mul;
+}
+
 bool AccumEnabled()
 {
     static int on = -1;
@@ -2733,8 +2764,8 @@ void DlssNr_Dx12::Dispatch(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* c
             accumParams.Height = guideHeight;
             accumParams.GuideWidth = guideWidth;
             accumParams.GuideHeight = guideHeight;
-            accumParams.MvScaleX = g_nr.guideMvScaleX;
-            accumParams.MvScaleY = g_nr.guideMvScaleY;
+            accumParams.MvScaleX = g_nr.guideMvScaleX * MvScaleMultiplier();
+            accumParams.MvScaleY = g_nr.guideMvScaleY * MvScaleMultiplier();
             accumParams.AccumReset = reset ? 1u : 0u;
 
             // Same shape as the answerHeld transitions below: UAV between frames, shader resource
@@ -2785,8 +2816,8 @@ void DlssNr_Dx12::Dispatch(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* c
         // tree until now -- so every dispatch ever made has read them as zero. The resolve works in uv,
         // so the scale wanted is the one that turns the game's units into GUIDE pixels: multiplying by
         // mvToWork as the evaluate call does would count the resolution ratio a second time.
-        resolveParams.MvScaleX = g_nr.guideMvScaleX;
-        resolveParams.MvScaleY = g_nr.guideMvScaleY;
+        resolveParams.MvScaleX = g_nr.guideMvScaleX * MvScaleMultiplier();
+        resolveParams.MvScaleY = g_nr.guideMvScaleY * MvScaleMultiplier();
         resolveParams.GuideWidth = guideWidth;
         resolveParams.GuideHeight = guideHeight;
 
