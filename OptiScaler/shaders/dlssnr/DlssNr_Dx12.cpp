@@ -1471,9 +1471,17 @@ float MvScaleMultiplier()
         {
             const double asked = atof(value);
 
-            // A zero or a negative would silently disable the reprojection and read as "the warp
-            // does nothing", which is the most misleading possible outcome for a probe.
-            if (asked > 0.01 && asked < 100.0)
+            // Negative is allowed and is the point: it flips the warp's DIRECTION, which is the
+            // one thing a scale multiplier cannot otherwise test. The first version of this rejected
+            // negatives on the grounds that one would "disable the reprojection" -- it does not, it
+            // reverses it, and excluding it hid the possibility that the motion vectors point the
+            // other way for an entire evening.
+            //
+            // Zero is still rejected. That one genuinely would disable the warp while looking like a
+            // measurement, which is the failure the original comment was reaching for.
+            const double size = asked < 0.0 ? -asked : asked;
+
+            if (size > 0.01 && size < 100.0)
                 mul = (float) asked;
         }
 
