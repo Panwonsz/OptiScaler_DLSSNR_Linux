@@ -1529,23 +1529,53 @@ float ConsistencyTolSetting()
     return tol;
 }
 
-bool DeltaEnabled()
+// 0 off, 1 the edit carried as a difference (0024), 2 as a ratio (0026). Any other non-zero value
+// means 1, so a build that was run with DLSS5_NR_DELTA=1 behaves exactly as it did.
+int DeltaMode()
 {
-    static int on = -1;
+    static int mode = -1;
 
-    if (on < 0)
+    if (mode < 0)
     {
         char value[16] {};
-        on = 0;
+        mode = 0;
 
         if (GetEnvironmentVariableA("DLSS5_NR_DELTA", value, sizeof(value)) != 0)
-            on = (value[0] != 0 && !(value[0] == '0' && value[1] == 0)) ? 1 : 0;
+            mode = atoi(value) == 2 ? 2 : (value[0] != 0 && !(value[0] == '0' && value[1] == 0)) ? 1 : 0;
 
-        if (on)
-            LOG_INFO("DLSS-NR: the edit is formed against the proxy each answer was made from (DLSS5_NR_DELTA)");
+        if (mode != 0)
+            LOG_INFO("DLSS-NR: the edit is formed against the proxy each answer was made from, carried as {} "
+                     "(DLSS5_NR_DELTA={})", mode == 2 ? "a ratio" : "a difference", mode);
     }
 
-    return on != 0;
+    return mode;
+}
+
+bool DeltaEnabled() { return DeltaMode() != 0; }
+
+// How far out the evidence gate looks, in output pixels. 0 (default) = the pixel alone.
+float ConsistencyRadiusSetting()
+{
+    static float px = -1.0f;
+
+    if (px < 0.0f)
+    {
+        char value[32] {};
+        px = 0.0f;
+
+        if (GetEnvironmentVariableA("DLSS5_NR_CONSIST_RADIUS", value, sizeof(value)) != 0)
+        {
+            const double asked = atof(value);
+
+            if (asked > 0.0 && asked <= 64.0)
+                px = (float) asked;
+        }
+
+        if (px > 0.0f)
+            LOG_INFO("DLSS-NR: the evidence gate also checks neighbours {:.1f} px away (DLSS5_NR_CONSIST_RADIUS)", px);
+    }
+
+    return px;
 }
 
 float TrustPxSetting()
@@ -3006,7 +3036,8 @@ void DlssNr_Dx12::Dispatch(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* c
         resolveParams.ReprojectWarpPx = reprojectWarpPx;
         resolveParams.ReprojectFadePx = reprojectFadePx;
         resolveParams.ReprojectTrustPx = TrustPxSetting();
-        resolveParams.ReprojectDelta = stagedForResolve != nullptr ? 1u : 0u;
+        resolveParams.ReprojectDelta = stagedForResolve != nullptr ? (unsigned int) DeltaMode() : 0u;
+        resolveParams.ConsistencyRadiusPx = stagedForResolve != nullptr ? ConsistencyRadiusSetting() : 0.0f;
         resolveParams.ConsistencyTol = stagedForResolve != nullptr ? ConsistencyTolSetting() : 0.0f;
 
         // The numbers the composition actually ran with, logged when any of them changes.

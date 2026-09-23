@@ -39,6 +39,7 @@ cbuffer Params : register(b0)
     float gReprojectTrustPx;// where the fade starts; negative = follow gReprojectWarpPx
     uint  gReprojectDelta; // resolve: 1 = form the edit against t5, the proxy the answer was made from
     float gConsistencyTol; // resolve: decline the edit where warped-old and current proxies differ by more; 0 = off
+    float gConsistencyRadiusPx; // resolve: also require neighbours this far away to pass; 0 = per-pixel
 };
 
 // Bringing an impossible colour back into a possible one.
@@ -407,6 +408,31 @@ float2 ReprojectOffset(float2 uv)
 // moments added together, and the doubled edge is the sum, not a defect of the model. Photo mode looked
 // correct because this weight was 1 across the whole frame; the same idea, per pixel and continuous,
 // costs nothing and never invents anything.
+// The evidence gate over a neighbourhood: this pixel and four neighbours gConsistencyRadiusPx away,
+// each compared at its OWN warped position. The per-pixel gate passes a background pixel beside a
+// moving edge, because the proxies there agree -- but the old answer at that spot still carries the
+// model's halo from the foreground it used to border. Requiring the surroundings to warp correctly
+// as well catches the halo, at the cost of declining the edit a few pixels further from each edge.
+float ConsistencyDilated(float2 cmpUv, float2 reprojUv)
+{
+    float c = Consistency(cmpUv, reprojUv);
+
+    if (gConsistencyRadiusPx <= 0.0 || c <= 0.0)
+        return c;
+
+    const float2 o = gConsistencyRadiusPx / float2(max(gWidth, 1u), max(gHeight, 1u));
+
+    [unroll]
+    for (int i = 0; i < 4; ++i)
+    {
+        const float2 d = i == 0 ? float2(o.x, 0.0) : i == 1 ? float2(-o.x, 0.0) : i == 2 ? float2(0.0, o.y) : float2(0.0, -o.y);
+        const float2 n = cmpUv + d;
+        c = min(c, Consistency(n, n + ReprojectOffset(n)));
+    }
+
+    return c;
+}
+
 float ReprojectConfidence(float2 uv)
 {
     if (gReprojectMode < 3 || gReprojectFadePx <= 0.0)
@@ -964,7 +990,7 @@ void CSMain(uint3 id : SV_DispatchThreadID)
                            : 1.0 - smoothstep(0.0, gReprojectFadePx, len - viewTrust);
 
         // And the evidence gate, so the view keeps showing what the resolve applies.
-        weight *= Consistency(cmpUv, reprojUv);
+        weight *= ConsistencyDilated(cmpUv, reprojUv);
 
         gTarget[id.xy] = float4(0.5 + 0.5 * dir.x, 0.5 + 0.5 * dir.y, weight, 1.0) * gDebugScale;
         return;
@@ -996,11 +1022,25 @@ void CSMain(uint3 id : SV_DispatchThreadID)
     {
         float4 stagedSample = gStaged.SampleLevel(gLinear, reprojUv, 0);
         float3 staged = gPassthrough != 0 ? stagedSample.rgb : SrgbToLinear(stagedSample.rgb);
-        model = max(proxy + (model - staged), 0.0);
+        if (gReprojectDelta == 2)
+        {
+            // As a ratio: a tone or colour edit is a multiplication, so it has to scale with the level
+            // the pixel has NOW. The additive form overshoots wherever the level changed since staging
+            // (exposure, flicker, a saturated colour's weak channel) and the clamp turns that into a
+            // dark blot. e keeps a near-black staged pixel from turning noise into a huge gain, and
+            // the clamp bounds whatever gets through.
+            const float e = 0.02;
+            const float3 r = clamp((model + e) / (staged + e), 0.25, 4.0);
+            model = max((proxy + e) * r - e, 0.0);
+        }
+        else
+        {
+            model = max(proxy + (model - staged), 0.0);
+        }
     }
 #endif
 
-    model = lerp(proxy, model, ReprojectConfidence(cmpUv) * Consistency(cmpUv, reprojUv));
+    model = lerp(proxy, model, ReprojectConfidence(cmpUv) * ConsistencyDilated(cmpUv, reprojUv));
 
     // The model's own answer, kept before the matched-residual block below can rewrite `model`, so the
     // replace decode uses what the model returned rather than the residual reconstruction.

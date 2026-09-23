@@ -238,6 +238,11 @@ struct alignas(256) DlssNrConstants
     // Resolve, with ReprojectDelta: how different the warped staged proxy and the current proxy may
     // be before the edit is declined for that pixel, in the proxy's own 0..1 encoding. 0 = off.
     float ConsistencyTol;
+
+    // Resolve: the evidence gate is taken as the minimum over this pixel and four neighbours this many
+    // OUTPUT pixels away, each at its own warped position. Catches the model's halo around an edge,
+    // which the per-pixel test passes because the proxies there agree. 0 = per-pixel only.
+    float ConsistencyRadiusPx;
 };
 
 // A constant buffer view's size must be a multiple of 256, and the struct is padded to exactly that.
