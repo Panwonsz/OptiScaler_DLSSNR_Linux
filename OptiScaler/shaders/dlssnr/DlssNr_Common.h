@@ -228,6 +228,12 @@ struct alignas(256) DlssNrConstants
     // uncapped (placing the edit where the motion field says it went) while the fade keeps a
     // threshold of its own. Those are different questions and they were one number.
     float ReprojectTrustPx;
+
+    // Resolve: 1 = t5 holds the proxy the answer was made FROM, and the edit is formed against it.
+    //
+    // 0 is the old behaviour, which forms the edit against the current frame's proxy -- correct only
+    // when the answer is fresh, and on the HIP path it never is. D3D12 only; Vulkan has no t5.
+    uint32_t ReprojectDelta;
 };
 
 // A constant buffer view's size must be a multiple of 256, and the struct is padded to exactly that.

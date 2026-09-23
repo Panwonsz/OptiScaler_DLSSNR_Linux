@@ -240,6 +240,14 @@ struct NrState
     unsigned int accumWidth = 0;
     unsigned int accumHeight = 0;
 
+    // The proxy each live answer was made from. [which answer], paired like the accumulators: one
+    // for the answer on screen, one for the answer in flight, swapped on delivery. stagedValid says a
+    // copy has actually been made into that slot -- an answer whose proxy was never captured falls
+    // back to the old subtraction rather than subtracting a black texture.
+    ID3D12Resource* proxyStaged[2] = {};
+    unsigned int stagedOnScreen = 0;
+    bool stagedValid[2] = { false, false };
+
     // Supersampling (working scale > 1): the Output Scaling upsampler used to enlarge the proxy to the
     // model's larger-than-native working size with a real filter instead of the box minifier. Created
     // lazily on the first super-native frame, released in Shutdown; sizes from the resources each call,
@@ -1493,6 +1501,27 @@ float MvScaleMultiplier()
 }
 
 // Where the fade starts, if it is not to follow the warp cap. Negative means it follows.
+// Whether to form the edit against the proxy the answer was made from. Off by default: off, t5 is
+// bound to the source like any unused slot and the resolve never reads it.
+bool DeltaEnabled()
+{
+    static int on = -1;
+
+    if (on < 0)
+    {
+        char value[16] {};
+        on = 0;
+
+        if (GetEnvironmentVariableA("DLSS5_NR_DELTA", value, sizeof(value)) != 0)
+            on = (value[0] != 0 && !(value[0] == '0' && value[1] == 0)) ? 1 : 0;
+
+        if (on)
+            LOG_INFO("DLSS-NR: the edit is formed against the proxy each answer was made from (DLSS5_NR_DELTA)");
+    }
+
+    return on != 0;
+}
+
 float TrustPxSetting()
 {
     static float px = -2.0f;
@@ -1779,7 +1808,7 @@ DlssNr_Dx12::DlssNr_Dx12(std::string InName, ID3D12Device* InDevice) : Shader_Dx
 bool DlssNr_Dx12::DispatchPass(ID3D12GraphicsCommandList* InCmdList, const DlssNrConstants& InConstants,
                                ID3D12Resource* InSource, ID3D12Resource* InModel, ID3D12Resource* InOriginal,
                                ID3D12Resource* InMotion, ID3D12Resource* InPrevEdit, ID3D12Resource* OutTarget,
-                               ID3D12Resource* OutKeep)
+                               ID3D12Resource* OutKeep, ID3D12Resource* InStaged)
 {
     if (!_init || InCmdList == nullptr || _device == nullptr || InSource == nullptr || OutTarget == nullptr)
         return false;
@@ -1798,6 +1827,7 @@ bool DlssNr_Dx12::DispatchPass(ID3D12GraphicsCommandList* InCmdList, const DlssN
         InOriginal != nullptr ? InOriginal : InSource,
         InMotion != nullptr ? InMotion : InSource,
         InPrevEdit != nullptr ? InPrevEdit : InSource,
+        InStaged != nullptr ? InStaged : InSource,
     };
 
     for (uint32_t i = 0; i < kSrvCount; ++i)
@@ -2072,6 +2102,11 @@ void DlssNr_Dx12::Dispatch(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* c
             g_nr.accumWidth = 0;
             g_nr.accumHeight = 0;
             g_nr.accumPrimed[0] = g_nr.accumPrimed[1] = false;
+
+            for (ID3D12Resource*& res : g_nr.proxyStaged)
+                ParkNrResource(res);
+
+            g_nr.stagedValid[0] = g_nr.stagedValid[1] = false;
         }
     }
 
@@ -2764,6 +2799,73 @@ void DlssNr_Dx12::Dispatch(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* c
                   cfg.DlssNrStyle.value_or_default());
     }
 
+    // Keep the proxy this frame's answer is being made from.
+    //
+    // Hip::Evaluate has just recorded modelInput's copy to the readback buffer; this records the same
+    // texture into a GPU-side slot, so that when the answer comes back ~25 frames from now there is
+    // something to subtract it from other than whatever is on screen then. Runs on every frame the
+    // pass runs, including the priming frames before the first answer, because the first staging
+    // happens there.
+    ID3D12Resource* stagedForResolve = nullptr;
+
+    if (DeltaEnabled() && useHip && modelInput != nullptr)
+    {
+        if (DlssNr::Hip::DeliveredLastFrame())
+            g_nr.stagedOnScreen ^= 1u;
+
+        if (DlssNr::Hip::StagedLastFrame())
+        {
+            const unsigned int slot = g_nr.stagedOnScreen ^ 1u;
+            const D3D12_RESOURCE_DESC inDesc = modelInput->GetDesc();
+
+            if (g_nr.proxyStaged[slot] != nullptr)
+            {
+                const D3D12_RESOURCE_DESC have = g_nr.proxyStaged[slot]->GetDesc();
+
+                // CopyResource needs identical geometry and format; a working-size change must not
+                // turn into a copy between mismatched resources.
+                if (have.Width != inDesc.Width || have.Height != inDesc.Height || have.Format != inDesc.Format)
+                {
+                    ParkNrResource(g_nr.proxyStaged[slot]);
+                    g_nr.stagedValid[slot] = false;
+                }
+            }
+
+            if (g_nr.proxyStaged[slot] == nullptr)
+            {
+                g_nr.proxyStaged[slot] =
+                    CreateScratch(device, inDesc.Format, (unsigned int) inDesc.Width, inDesc.Height);
+
+                if (g_nr.proxyStaged[slot] != nullptr)
+                    g_nr.proxyStaged[slot]->SetName(slot == 0 ? L"DLSS-NR proxyStaged 0" : L"DLSS-NR proxyStaged 1");
+            }
+
+            if (g_nr.proxyStaged[slot] != nullptr)
+            {
+                // modelInput is NON_PIXEL_SHADER_RESOURCE here: colorCopy and colorSmall are moved there
+                // after the encode/downsample and stay until the end of Dispatch, and Evaluate restores
+                // it after borrowing COPY_SOURCE. proxyStaged rests in UNORDERED_ACCESS, as CreateScratch
+                // makes it and as every other scratch texture here is kept between uses.
+                Barrier(cmdList, modelInput, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                        D3D12_RESOURCE_STATE_COPY_SOURCE);
+                Barrier(cmdList, g_nr.proxyStaged[slot], D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                        D3D12_RESOURCE_STATE_COPY_DEST);
+
+                cmdList->CopyResource(g_nr.proxyStaged[slot], modelInput);
+
+                Barrier(cmdList, g_nr.proxyStaged[slot], D3D12_RESOURCE_STATE_COPY_DEST,
+                        D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+                Barrier(cmdList, modelInput, D3D12_RESOURCE_STATE_COPY_SOURCE,
+                        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+
+                g_nr.stagedValid[slot] = true;
+            }
+        }
+
+        if (g_nr.stagedValid[g_nr.stagedOnScreen])
+            stagedForResolve = g_nr.proxyStaged[g_nr.stagedOnScreen];
+    }
+
     // Integrate one frame of motion into each live field.
     //
     // Both, every frame, and this is the part that cannot be economised: the field belonging to the
@@ -2878,6 +2980,7 @@ void DlssNr_Dx12::Dispatch(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* c
         resolveParams.ReprojectWarpPx = reprojectWarpPx;
         resolveParams.ReprojectFadePx = reprojectFadePx;
         resolveParams.ReprojectTrustPx = TrustPxSetting();
+        resolveParams.ReprojectDelta = stagedForResolve != nullptr ? 1u : 0u;
 
         // The numbers the composition actually ran with, logged when any of them changes.
         //
@@ -3018,8 +3121,16 @@ void DlssNr_Dx12::Dispatch(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* c
             Barrier(cmdList, accumForResolve, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
                     D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
 
+        if (stagedForResolve != nullptr)
+            Barrier(cmdList, stagedForResolve, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                    D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+
         DispatchPass(cmdList, resolveParams, resolveProxy, resolveAnswer, g_nr.hdrCopy, reprojectSource, exposureTex,
-                     target, nullptr);
+                     target, nullptr, stagedForResolve);
+
+        if (stagedForResolve != nullptr)
+            Barrier(cmdList, stagedForResolve, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
 
         if (accumForResolve != nullptr)
             Barrier(cmdList, accumForResolve, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,

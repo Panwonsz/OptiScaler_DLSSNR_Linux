@@ -37,6 +37,7 @@ cbuffer Params : register(b0)
     uint  gReprojectAccum; // resolve: 1 = t3 is the accumulated field in guide uv, not motion
     uint  gAccumReset;     // accumulate: 1 = write zero, for the frame the answer is staged
     float gReprojectTrustPx;// where the fade starts; negative = follow gReprojectWarpPx
+    uint  gReprojectDelta; // resolve: 1 = form the edit against t5, the proxy the answer was made from
 };
 
 // Bringing an impossible colour back into a possible one.
@@ -236,6 +237,10 @@ Texture2D<float4>   gMotion   : register(t3);  // resolve, accumulating: the gam
 // live path is compiled out under VK_MODE and gUseGameExposure is never set on that backend.
 #ifndef VK_MODE
 Texture2D<float4>   gExposure : register(t4);
+
+// The proxy the answer in gModel was made FROM -- copied on the frame it was staged. D3D12 only, for
+// the same reason as gExposure: the Vulkan backend has no descriptor for it.
+Texture2D<float4>   gStaged   : register(t5);
 #endif
 #ifdef VK_MODE
 [[vk::binding(5, 0)]]
@@ -904,7 +909,14 @@ void CSMain(uint3 id : SV_DispatchThreadID)
         float2 px = ReprojectPixels(cmpUv);
         float len = length(px);
         float2 dir = len > 1e-6 ? px / len : float2(0.0, 0.0);
-        float weight = saturate(1.0 - (len - gReprojectWarpPx) / max(gReprojectFadePx, 1e-6));
+        // Exactly what ReprojectConfidence computes. It cannot simply be called -- it returns 1 for
+        // modes below 3, and this is mode 2 -- so it is restated here. The previous line used the warp
+        // cap as the threshold and a linear ramp, while the resolve uses the trust threshold and a
+        // smoothstep: the instrument was showing a confidence that nothing applied.
+        const float viewTrust = gReprojectTrustPx >= 0.0 ? gReprojectTrustPx : gReprojectWarpPx;
+        float weight = gReprojectFadePx <= 0.0
+                           ? 1.0
+                           : 1.0 - smoothstep(0.0, gReprojectFadePx, len - viewTrust);
 
         gTarget[id.xy] = float4(0.5 + 0.5 * dir.x, 0.5 + 0.5 * dir.y, weight, 1.0) * gDebugScale;
         return;
@@ -923,6 +935,23 @@ void CSMain(uint3 id : SV_DispatchThreadID)
     //
     // At weight 0 the model contributes exactly nothing and the frame comes through as the upscaler made
     // it, which is the correct answer for a pixel that has moved half the screen since the model saw it.
+#ifndef VK_MODE
+    // Form the edit against the picture the model was actually shown.
+    //
+    // Without this, (model vs proxy) is the model's change PLUS every change in the scene since the
+    // answer's proxy was staged -- a copy of the old frame laid over the new one, which no warp can
+    // remove because the subtraction itself is against the wrong picture. The staged proxy is read
+    // at the same warped uv as the answer: both are pictures of the scene at staging time, so they
+    // are registered with each other exactly, and only their difference is carried to where the
+    // scene is now. Clamped at zero because a linear colour cannot go negative, and a delta can.
+    if (gReprojectDelta != 0)
+    {
+        float4 stagedSample = gStaged.SampleLevel(gLinear, reprojUv, 0);
+        float3 staged = gPassthrough != 0 ? stagedSample.rgb : SrgbToLinear(stagedSample.rgb);
+        model = max(proxy + (model - staged), 0.0);
+    }
+#endif
+
     model = lerp(proxy, model, ReprojectConfidence(cmpUv));
 
     // The model's own answer, kept before the matched-residual block below can rewrite `model`, so the
