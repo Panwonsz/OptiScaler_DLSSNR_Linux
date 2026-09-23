@@ -234,6 +234,10 @@ struct alignas(256) DlssNrConstants
     // 0 is the old behaviour, which forms the edit against the current frame's proxy -- correct only
     // when the answer is fresh, and on the HIP path it never is. D3D12 only; Vulkan has no t5.
     uint32_t ReprojectDelta;
+
+    // Resolve, with ReprojectDelta: how different the warped staged proxy and the current proxy may
+    // be before the edit is declined for that pixel, in the proxy's own 0..1 encoding. 0 = off.
+    float ConsistencyTol;
 };
 
 // A constant buffer view's size must be a multiple of 256, and the struct is padded to exactly that.

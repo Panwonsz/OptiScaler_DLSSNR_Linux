@@ -1503,6 +1503,32 @@ float MvScaleMultiplier()
 // Where the fade starts, if it is not to follow the warp cap. Negative means it follows.
 // Whether to form the edit against the proxy the answer was made from. Off by default: off, t5 is
 // bound to the source like any unused slot and the resolve never reads it.
+// The evidence gate's tolerance, in the proxy's 0..1 encoding. 0 (the default) is off.
+float ConsistencyTolSetting()
+{
+    static float tol = -1.0f;
+
+    if (tol < 0.0f)
+    {
+        char value[32] {};
+        tol = 0.0f;
+
+        if (GetEnvironmentVariableA("DLSS5_NR_CONSIST", value, sizeof(value)) != 0)
+        {
+            const double asked = atof(value);
+
+            if (asked > 0.0 && asked <= 1.0)
+                tol = (float) asked;
+        }
+
+        if (tol > 0.0f)
+            LOG_INFO("DLSS-NR: the edit is declined where the warped staged proxy and the current one "
+                     "differ by more than {:.3f} (DLSS5_NR_CONSIST)", tol);
+    }
+
+    return tol;
+}
+
 bool DeltaEnabled()
 {
     static int on = -1;
@@ -2981,6 +3007,7 @@ void DlssNr_Dx12::Dispatch(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* c
         resolveParams.ReprojectFadePx = reprojectFadePx;
         resolveParams.ReprojectTrustPx = TrustPxSetting();
         resolveParams.ReprojectDelta = stagedForResolve != nullptr ? 1u : 0u;
+        resolveParams.ConsistencyTol = stagedForResolve != nullptr ? ConsistencyTolSetting() : 0.0f;
 
         // The numbers the composition actually ran with, logged when any of them changes.
         //

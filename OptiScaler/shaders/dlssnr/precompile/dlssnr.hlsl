@@ -38,6 +38,7 @@ cbuffer Params : register(b0)
     uint  gAccumReset;     // accumulate: 1 = write zero, for the frame the answer is staged
     float gReprojectTrustPx;// where the fade starts; negative = follow gReprojectWarpPx
     uint  gReprojectDelta; // resolve: 1 = form the edit against t5, the proxy the answer was made from
+    float gConsistencyTol; // resolve: decline the edit where warped-old and current proxies differ by more; 0 = off
 };
 
 // Bringing an impossible colour back into a possible one.
@@ -315,6 +316,50 @@ float3 SrgbToLinear(float3 v)
 // vectors are already uv and a brisk pan is 1-3% of the screen per frame -- times sixteen frames of
 // staleness, a quarter to a half of the screen. Worth knowing in pixels rather than in uv, because
 // "0.3" reads as small and 576 px does not.
+// How far to believe the warp at this pixel, from evidence rather than from distance.
+//
+// cmpUv is where the pixel is now; reprojUv is where the warp says it was when the answer was made.
+// If the staged proxy at reprojUv looks like the current proxy at cmpUv, the warp described this
+// pixel and its edit is the right one. If not -- a surface revealed since staging, a transparent
+// effect like mist that has no vectors of its own, anything that changed -- the edit carried here
+// belongs to something else and is declined.
+//
+// A 4-tap tent on both sides, because the upscaler jitters the proxy each frame and single pixels at
+// edges disagree even under an exact warp; without it the gate would strip edge detail, which is the
+// detail the model adds most of.
+#ifndef VK_MODE
+float Consistency(float2 cmpUv, float2 reprojUv)
+{
+    if (gReprojectDelta == 0 || gConsistencyTol <= 0.0)
+        return 1.0;
+
+    uint pw, ph, sw, sh;
+    gSource.GetDimensions(pw, ph);
+    gStaged.GetDimensions(sw, sh);
+
+    const float2 pt = 0.5 / float2(max(pw, 1u), max(ph, 1u));
+    const float2 st = 0.5 / float2(max(sw, 1u), max(sh, 1u));
+
+    float3 now = float3(0.0, 0.0, 0.0);
+    float3 then = float3(0.0, 0.0, 0.0);
+
+    [unroll]
+    for (int i = 0; i < 4; ++i)
+    {
+        const float2 o = float2((i & 1) != 0 ? 1.0 : -1.0, (i & 2) != 0 ? 1.0 : -1.0);
+        now += gSource.SampleLevel(gLinear, cmpUv + o * pt, 0).rgb;
+        then += gStaged.SampleLevel(gLinear, reprojUv + o * st, 0).rgb;
+    }
+
+    const float3 d = abs(now - then) * 0.25;
+    const float diff = max(d.r, max(d.g, d.b));
+
+    return 1.0 - smoothstep(0.5 * gConsistencyTol, gConsistencyTol, diff);
+}
+#else
+float Consistency(float2 cmpUv, float2 reprojUv) { return 1.0; }
+#endif
+
 float2 ReprojectPixels(float2 uv)
 {
     if (gReprojectMode == 0)
@@ -918,6 +963,9 @@ void CSMain(uint3 id : SV_DispatchThreadID)
                            ? 1.0
                            : 1.0 - smoothstep(0.0, gReprojectFadePx, len - viewTrust);
 
+        // And the evidence gate, so the view keeps showing what the resolve applies.
+        weight *= Consistency(cmpUv, reprojUv);
+
         gTarget[id.xy] = float4(0.5 + 0.5 * dir.x, 0.5 + 0.5 * dir.y, weight, 1.0) * gDebugScale;
         return;
     }
@@ -952,7 +1000,7 @@ void CSMain(uint3 id : SV_DispatchThreadID)
     }
 #endif
 
-    model = lerp(proxy, model, ReprojectConfidence(cmpUv));
+    model = lerp(proxy, model, ReprojectConfidence(cmpUv) * Consistency(cmpUv, reprojUv));
 
     // The model's own answer, kept before the matched-residual block below can rewrite `model`, so the
     // replace decode uses what the model returned rather than the residual reconstruction.
