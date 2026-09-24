@@ -83,7 +83,7 @@ struct Response
 
 // Printed at init. Two builds in a row produced an identical failure, and nothing in the log said
 // whether the second one was the DLL actually being loaded.
-constexpr const char* kBuildMark = "2026-09-23c";
+constexpr const char* kBuildMark = "2026-09-24a";
 
 // ---------------------------------------------------------------------------------------------
 // Pixel conversion does not happen here any more.
@@ -623,6 +623,37 @@ bool CreateStaging(ID3D12Device* device, const D3D12_RESOURCE_DESC& desc, bool n
     return true;
 }
 
+// How many frames to let pass before assuming a recorded copy has run, in the modes that have no fence to
+// ask -- at both ends of the exchange. DLSS5_NR_FRAME_LAG=1..3; unset is 3, the original constant.
+//
+// Three was chosen when the model took ~230 ms and six frames of waiting per cycle cost nothing. At 84 FPS
+// they are ~71 ms of a ~228 ms cycle, and all of it ages the answer. Shorter is only safe while the copy
+// recorded that many frames ago has really executed: too short and the model occasionally reads a
+// half-written frame, which shows up as a one-answer glitch rather than as a steady fault.
+UINT64 FrameLag()
+{
+    static int lag = 0;
+
+    if (lag == 0)
+    {
+        char value[16] {};
+        lag = 3;
+
+        if (GetEnvironmentVariableA("DLSS5_NR_FRAME_LAG", value, sizeof(value)) != 0)
+        {
+            const int asked = atoi(value);
+
+            if (asked >= 1 && asked <= 3)
+                lag = asked;
+        }
+
+        LOG_INFO("DLSS-NR (HIP): frame lag {} at each end of the exchange{}", lag,
+                 lag == 3 ? "" : " (DLSS5_NR_FRAME_LAG)");
+    }
+
+    return UINT64(lag);
+}
+
 // The gap between deliveries, smoothed. Called from Evaluate with g.lock held.
 //
 // Recorded on every delivery in both clock regimes, so the number does not silently become zero if
@@ -644,6 +675,15 @@ void NoteDeliveryLocked()
     }
 
     g.lastDelivery = now;
+
+    // What the cycle actually costs, logged often enough to read off a short test and rarely enough not to
+    // flood the file. The interval is the number DLSS5_NR_FRAME_LAG should move: half of it is added to
+    // every answer's age on screen.
+    static unsigned int delivered = 0;
+
+    if (++delivered % 32 == 0 && g.answerIntervalMs > 0.0f)
+        LOG_INFO("DLSS-NR (HIP): answer every {:.1f} ms (model round trip {:.1f} ms, frame lag {})",
+                 g.answerIntervalMs, g.lastMs, (unsigned int) FrameLag());
 }
 
 } // namespace
@@ -685,10 +725,7 @@ int Mode()
     return mode;
 }
 
-// How many frames to let pass before assuming a recorded copy has run, in the modes that have no
-// fence to ask. Three is far more than the one or two frames a submission is ever behind, and at four
-// model frames a second it costs nothing.
-constexpr UINT64 kFrameLag = 3;
+// The frame lag is FrameLag(), above: adjustable with DLSS5_NR_FRAME_LAG, 3 when unset.
 
 bool Enabled()
 {
@@ -890,7 +927,7 @@ int Evaluate(ID3D12GraphicsCommandList* cmdList, ID3D12CommandQueue* queue, ID3D
         {
             // No fence to ask, so the frame counter answers instead: a copy recorded three frames ago
             // has run, and a buffer the GPU was reading three frames ago is free.
-            if (g.stage == Exchange::Stage::Recorded && frame >= g.recordedAtFrame + kFrameLag)
+            if (g.stage == Exchange::Stage::Recorded && frame >= g.recordedAtFrame + FrameLag())
             {
                 g.stage = Exchange::Stage::Submitted;
                 g.wake.notify_one();
@@ -908,7 +945,7 @@ int Evaluate(ID3D12GraphicsCommandList* cmdList, ID3D12CommandQueue* queue, ID3D
                 NoteDeliveryLocked();
             }
             else if (g.stage == Exchange::Stage::Idle && mayStage &&
-                     (g.deliveredAtFrame == 0 || frame >= g.deliveredAtFrame + kFrameLag))
+                     (g.deliveredAtFrame == 0 || frame >= g.deliveredAtFrame + FrameLag()))
             {
                 stage = true;
                 g.stage = Exchange::Stage::Recorded;
