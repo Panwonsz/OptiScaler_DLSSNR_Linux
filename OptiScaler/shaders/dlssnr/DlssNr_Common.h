@@ -243,6 +243,14 @@ struct alignas(256) DlssNrConstants
     // OUTPUT pixels away, each at its own warped position. Catches the model's halo around an edge,
     // which the per-pixel test passes because the proxies there agree. 0 = per-pixel only.
     float ConsistencyRadiusPx;
+
+    // Resolve: the weight of this frame's correction in the running average of corrections (0 = off). The
+    // previous average is read at t7, one frame of motion at t6, and the new average written to u1.
+    float EditAlpha;
+
+    // Resolve: 1 = the texture at t7 holds a valid previous average. 0 on the first frame and after any
+    // reallocation, when the average starts from this frame's correction alone.
+    uint32_t EditHistValid;
 };
 
 // A constant buffer view's size must be a multiple of 256, and the struct is padded to exactly that.

@@ -69,7 +69,10 @@ class DlssNr_Dx12 : public Shader_Dx12, public DlssNr_Common
     // Six: the sixth (t5) is the proxy an answer was made from, so the resolve can form the edit
     // against what the model was shown rather than against the current frame. The root signature,
     // the per-frame heaps and DispatchPass's binding loop all take their size from this constant.
-    static constexpr uint32_t kSrvCount = 6;
+    // Eight: t6 is one frame of the game's motion vectors and t7 the previous running average of the
+    // model's correction (0028). The root signature, the per-frame heaps and DispatchPass's binding loop
+    // all take their size from this constant.
+    static constexpr uint32_t kSrvCount = 8;
     static constexpr uint32_t kUavCount = 2;
 
     uint32_t _numThreadsX = 8;
@@ -105,5 +108,7 @@ class DlssNr_Dx12 : public Shader_Dx12, public DlssNr_Common
                   ID3D12Resource* OutKeep,
                   // t5: the proxy the answer was made from. Only the resolve passes it; the source
                   // stands in everywhere else, like every other unused slot.
-                  ID3D12Resource* InStaged = nullptr);
+                  ID3D12Resource* InStaged = nullptr,
+                  // t6/t7: one frame of motion and the previous average of the correction. Resolve only.
+                  ID3D12Resource* InMotionFrame = nullptr, ID3D12Resource* InEditPrev = nullptr);
 };

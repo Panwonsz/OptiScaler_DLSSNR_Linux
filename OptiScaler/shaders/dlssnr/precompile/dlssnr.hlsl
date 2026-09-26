@@ -40,6 +40,8 @@ cbuffer Params : register(b0)
     uint  gReprojectDelta; // resolve: 1 = form the edit against t5, the proxy the answer was made from
     float gConsistencyTol; // resolve: decline the edit where warped-old and current proxies differ by more; 0 = off
     float gConsistencyRadiusPx; // resolve: also require neighbours this far away to pass; 0 = per-pixel
+    float gEditAlpha;      // resolve: weight of this frame's correction in the running average; 0 = off
+    uint  gEditHistValid;  // resolve: 1 = t7 holds a valid previous average
 };
 
 // Bringing an impossible colour back into a possible one.
@@ -243,6 +245,11 @@ Texture2D<float4>   gExposure : register(t4);
 // The proxy the answer in gModel was made FROM -- copied on the frame it was staged. D3D12 only, for
 // the same reason as gExposure: the Vulkan backend has no descriptor for it.
 Texture2D<float4>   gStaged   : register(t5);
+
+// The running average of the model's correction (0028): one frame of the game's motion vectors, to move
+// last frame's average to this frame, and last frame's average itself. D3D12 only, like t4 and t5.
+Texture2D<float4>   gMotionFrame : register(t6);
+Texture2D<float4>   gEditPrev    : register(t7);
 #endif
 #ifdef VK_MODE
 [[vk::binding(5, 0)]]
@@ -1040,7 +1047,35 @@ void CSMain(uint3 id : SV_DispatchThreadID)
     }
 #endif
 
-    model = lerp(proxy, model, ReprojectConfidence(cmpUv) * ConsistencyDilated(cmpUv, reprojUv));
+    const float warpTrust = ReprojectConfidence(cmpUv) * ConsistencyDilated(cmpUv, reprojUv);
+    model = lerp(proxy, model, warpTrust);
+
+#ifndef VK_MODE
+    // Average the correction, not the picture. See 0028: successive answers disagree on fine detail, and
+    // blending whole answers ghosts in motion. The correction is small and local, so a running average of
+    // it damps the disagreement without carrying an old image anywhere. The history is moved one frame
+    // by the game's vectors and multiplied by this pixel's trust, so wherever the edit is declined the
+    // history goes with it.
+    if (gEditAlpha > 0.0 && gCompareMode == 0)
+    {
+        const float3 editNow = model - proxy;
+        float3 hist = editNow;
+
+        if (gEditHistValid != 0)
+        {
+            const float2 guide = float2(max(gGuideWidth, 1u), max(gGuideHeight, 1u));
+            const float2 mv = gMotionFrame.SampleLevel(gLinear, cmpUv, 0).xy;
+            const float2 prevUv = cmpUv + float2(mv.x * gMvScaleX, mv.y * gMvScaleY) / guide;
+
+            if (prevUv.x >= 0.0 && prevUv.x <= 1.0 && prevUv.y >= 0.0 && prevUv.y <= 1.0)
+                hist = gEditPrev.SampleLevel(gLinear, prevUv, 0).rgb * warpTrust;
+        }
+
+        const float3 editAvg = lerp(hist, editNow, gEditAlpha);
+        gKeep[id.xy] = float4(editAvg, 1.0);
+        model = max(proxy + editAvg, 0.0);
+    }
+#endif
 
     // The model's own answer, kept before the matched-residual block below can rewrite `model`, so the
     // replace decode uses what the model returned rather than the residual reconstruction.

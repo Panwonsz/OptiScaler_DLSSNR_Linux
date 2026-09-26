@@ -245,6 +245,14 @@ struct NrState
     // copy has actually been made into that slot -- an answer whose proxy was never captured falls
     // back to the old subtraction rather than subtracting a black texture.
     ID3D12Resource* proxyStaged[2] = {};
+
+    // The running average of the model's correction (0028), ping-ponged at output resolution. editValid
+    // says the one about to be read holds a real average; it is false after any reallocation.
+    ID3D12Resource* editHist[2] = {};
+    unsigned int editPing = 0;
+    bool editValid = false;
+    unsigned int editWidth = 0;
+    unsigned int editHeight = 0;
     unsigned int stagedOnScreen = 0;
     bool stagedValid[2] = { false, false };
 
@@ -1554,6 +1562,32 @@ int DeltaMode()
 bool DeltaEnabled() { return DeltaMode() != 0; }
 
 // How far out the evidence gate looks, in output pixels. 0 (default) = the pixel alone.
+// The weight of each frame's correction in the running average (0028). 0 (the default) is off.
+float EditAlphaSetting()
+{
+    static float alpha = -1.0f;
+
+    if (alpha < 0.0f)
+    {
+        char value[32] {};
+        alpha = 0.0f;
+
+        if (GetEnvironmentVariableA("DLSS5_NR_EDIT_AVG", value, sizeof(value)) != 0)
+        {
+            const double asked = atof(value);
+
+            if (asked > 0.0 && asked <= 1.0)
+                alpha = (float) asked;
+        }
+
+        if (alpha > 0.0f)
+            LOG_INFO("DLSS-NR: the model's correction is averaged over time, {:.2f} of each frame's taken "
+                     "(DLSS5_NR_EDIT_AVG; needs DLSS5_NR_DELTA)", alpha);
+    }
+
+    return alpha;
+}
+
 float ConsistencyRadiusSetting()
 {
     static float px = -1.0f;
@@ -1864,7 +1898,8 @@ DlssNr_Dx12::DlssNr_Dx12(std::string InName, ID3D12Device* InDevice) : Shader_Dx
 bool DlssNr_Dx12::DispatchPass(ID3D12GraphicsCommandList* InCmdList, const DlssNrConstants& InConstants,
                                ID3D12Resource* InSource, ID3D12Resource* InModel, ID3D12Resource* InOriginal,
                                ID3D12Resource* InMotion, ID3D12Resource* InPrevEdit, ID3D12Resource* OutTarget,
-                               ID3D12Resource* OutKeep, ID3D12Resource* InStaged)
+                               ID3D12Resource* OutKeep, ID3D12Resource* InStaged,
+                               ID3D12Resource* InMotionFrame, ID3D12Resource* InEditPrev)
 {
     if (!_init || InCmdList == nullptr || _device == nullptr || InSource == nullptr || OutTarget == nullptr)
         return false;
@@ -1884,6 +1919,8 @@ bool DlssNr_Dx12::DispatchPass(ID3D12GraphicsCommandList* InCmdList, const DlssN
         InMotion != nullptr ? InMotion : InSource,
         InPrevEdit != nullptr ? InPrevEdit : InSource,
         InStaged != nullptr ? InStaged : InSource,
+        InMotionFrame != nullptr ? InMotionFrame : InSource,
+        InEditPrev != nullptr ? InEditPrev : InSource,
     };
 
     for (uint32_t i = 0; i < kSrvCount; ++i)
@@ -2163,6 +2200,12 @@ void DlssNr_Dx12::Dispatch(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* c
                 ParkNrResource(res);
 
             g_nr.stagedValid[0] = g_nr.stagedValid[1] = false;
+
+            for (ID3D12Resource*& res : g_nr.editHist)
+                ParkNrResource(res);
+
+            g_nr.editValid = false;
+            g_nr.editWidth = g_nr.editHeight = 0;
         }
     }
 
@@ -3183,8 +3226,65 @@ void DlssNr_Dx12::Dispatch(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* c
             Barrier(cmdList, stagedForResolve, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
                     D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
 
+        // The running average of the correction (0028). Only with the staged proxy -- without it the
+        // correction still contains the scene change since staging, and averaging that averages a ghost --
+        // and only with the game's own motion vectors to move the history by one frame.
+        ID3D12Resource* editPrev = nullptr;
+        ID3D12Resource* editNext = nullptr;
+
+        if (EditAlphaSetting() > 0.0f && stagedForResolve != nullptr && motionIn != nullptr &&
+            resolveParams.CompareMode == 0)
+        {
+            if (g_nr.editWidth != width || g_nr.editHeight != height || g_nr.editHist[0] == nullptr ||
+                g_nr.editHist[1] == nullptr)
+            {
+                for (ID3D12Resource*& res : g_nr.editHist)
+                    ParkNrResource(res);
+
+                g_nr.editValid = false;
+                g_nr.editWidth = g_nr.editHeight = 0;
+
+                g_nr.editHist[0] = CreateScratch(device, DXGI_FORMAT_R16G16B16A16_FLOAT, width, height);
+                g_nr.editHist[1] = CreateScratch(device, DXGI_FORMAT_R16G16B16A16_FLOAT, width, height);
+
+                if (g_nr.editHist[0] != nullptr && g_nr.editHist[1] != nullptr)
+                {
+                    g_nr.editHist[0]->SetName(L"DLSS-NR editHist 0");
+                    g_nr.editHist[1]->SetName(L"DLSS-NR editHist 1");
+                    g_nr.editWidth = width;
+                    g_nr.editHeight = height;
+                }
+                else
+                {
+                    for (ID3D12Resource*& res : g_nr.editHist)
+                        ParkNrResource(res);
+                }
+            }
+
+            if (g_nr.editWidth == width && g_nr.editHeight == height)
+            {
+                editPrev = g_nr.editHist[g_nr.editPing];
+                editNext = g_nr.editHist[g_nr.editPing ^ 1u];
+                resolveParams.EditAlpha = EditAlphaSetting();
+                resolveParams.EditHistValid = g_nr.editValid ? 1u : 0u;
+
+                // Both rest in UNORDERED_ACCESS, as CreateScratch makes them: the one being written stays
+                // there, the one being read is a shader resource for the length of the dispatch.
+                Barrier(cmdList, editPrev, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+            }
+        }
+
         DispatchPass(cmdList, resolveParams, resolveProxy, resolveAnswer, g_nr.hdrCopy, reprojectSource, exposureTex,
-                     target, nullptr, stagedForResolve);
+                     target, editNext, stagedForResolve, editPrev != nullptr ? motionIn : nullptr, editPrev);
+
+        if (editPrev != nullptr)
+        {
+            Barrier(cmdList, editPrev, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+            g_nr.editPing ^= 1u;
+            g_nr.editValid = true;
+        }
 
         if (stagedForResolve != nullptr)
             Barrier(cmdList, stagedForResolve, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
