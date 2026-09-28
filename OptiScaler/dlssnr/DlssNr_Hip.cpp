@@ -83,7 +83,7 @@ struct Response
 
 // Printed at init. Two builds in a row produced an identical failure, and nothing in the log said
 // whether the second one was the DLL actually being loaded.
-constexpr const char* kBuildMark = "2026-09-26a";
+constexpr const char* kBuildMark = "2026-09-28a";
 
 // ---------------------------------------------------------------------------------------------
 // Pixel conversion does not happen here any more.
@@ -686,6 +686,557 @@ void NoteDeliveryLocked()
                  g.answerIntervalMs, g.lastMs, (unsigned int) FrameLag());
 }
 
+// ---------------------------------------------------------------------------------------------
+// Per-frame synchronous mode: DLSS5_NR_SYNC=1 (0030).
+//
+// The exchange above runs one answer at a time and lets the game run ahead of it, so what is on
+// screen is an answer many frames old and the fade, the accumulation and the delta exist to hide
+// that. This mode does the opposite: EVERY frame is sent to the model, and the render thread waits
+// for the answer, so the game runs at the model's pace and what is on screen is exactly one frame
+// old. One frame, not zero, because the answer cannot be put back into the list that is still being
+// recorded; it goes into the next one:
+//
+//   Evaluate(N), recording the game's list L(N):
+//     1. wait -- on this thread, with a timeout -- for the answer to frame N-1
+//     2. record: copy that answer (upload slot) over the output; the resolve composes it
+//     3. record: stage proxy N into readback slot N % 3, then copy N into that slot's flag
+//     4. queue job N for the worker
+//   worker: watch the flag until it reads N -- the game's GPU has now executed L(N)'s copy --
+//           send slot N % 3 to the daemon, receive the answer into upload slot N % 3, mark done
+//
+// Nothing here touches the game's queue: the flag replaces both the fence of modes 2-4 and the
+// frame counting of mode 5, and it fires the moment the copy has run instead of three frames later.
+//
+// Why three slots are enough: an answer's upload slot is next written by job N+3, which starts only
+// after its flag -- i.e. after L(N+3), and so L(N+1) that read the answer, has executed. A readback
+// slot is next written by frame N+3's staging, which is recorded only after the render thread has
+// waited for answer N+2, and the worker takes jobs in order.
+//
+// A game that records frame N+1 before submitting frame N would make step 1 wait for a copy that
+// cannot run yet. The wait therefore has a timeout (DLSS5_NR_SYNC_WAIT_MS, 400): on expiry the frame
+// is composed with the answer it already has and staging goes on, so such a game degrades instead of
+// hanging. The log counts those.
+
+bool SyncRequested()
+{
+    static int on = -1;
+
+    if (on < 0)
+    {
+        char value[16] {};
+        on = GetEnvironmentVariableA("DLSS5_NR_SYNC", value, sizeof(value)) != 0 && value[0] == '1' &&
+                     value[1] == 0
+                 ? 1
+                 : 0;
+    }
+
+    return on == 1;
+}
+
+// Sync needs mode 5's rules -- deliver, stage, never the queue. Any other mode keeps its own exchange.
+bool SyncActive(int mode)
+{
+    if (!SyncRequested())
+        return false;
+
+    if (mode != 5)
+    {
+        static bool said = false;
+
+        if (!said)
+        {
+            said = true;
+            LOG_WARN("DLSS-NR (HIP): DLSS5_NR_SYNC=1 needs DLSS5_NR_MODE 5 (the default); mode {} keeps the "
+                     "asynchronous exchange",
+                     mode);
+        }
+
+        return false;
+    }
+
+    return true;
+}
+
+std::chrono::milliseconds SyncWait()
+{
+    static int ms = -1;
+
+    if (ms < 0)
+    {
+        char value[16] {};
+        ms = 400;
+
+        if (GetEnvironmentVariableA("DLSS5_NR_SYNC_WAIT_MS", value, sizeof(value)) != 0)
+        {
+            const int asked = atoi(value);
+
+            if (asked >= 10 && asked <= 5000)
+                ms = asked;
+        }
+    }
+
+    return std::chrono::milliseconds(ms);
+}
+
+struct SyncExchange
+{
+    static constexpr unsigned int kSlots = 3;
+    static constexpr unsigned int kSeqRing = 64;
+    static constexpr UINT64 kStride = 256; // one flag / one ring entry per 256 bytes
+
+    // Slot 0 is the exchange's own readback/upload pair; 1 and 2 are made here.
+    ID3D12Resource* readback[kSlots] {};
+    ID3D12Resource* upload[kSlots] {};
+    uint8_t* readbackMapped[kSlots] {};
+    uint8_t* uploadMapped[kSlots] {};
+
+    // The flags the worker watches (READBACK), the frame numbers the list copies into them (an UPLOAD
+    // ring written at record time), and a DEFAULT hop between the two -- see GuardedRecordSync.
+    ID3D12Resource* flags = nullptr;
+    const volatile uint64_t* flagsMapped = nullptr;
+    ID3D12Resource* seq = nullptr;
+    uint64_t* seqMapped = nullptr;
+    ID3D12Resource* seqHop = nullptr;
+
+    enum class Slot
+    {
+        Free,
+        Queued,
+        Running,
+        Done,
+        Failed
+    };
+
+    Slot state[kSlots] { Slot::Free, Slot::Free, Slot::Free };
+    UINT64 frameOf[kSlots] {};
+    std::condition_variable done; // with g.lock
+
+    // For the log.
+    float waitMs = 0.0f;  // the render thread, waiting for the previous answer
+    float readyMs = 0.0f; // the worker, waiting for the game's GPU to run the staging copy
+    unsigned int timeouts = 0;
+    unsigned int skipped = 0;
+};
+
+SyncExchange gs;
+
+bool CreateSyncStaging(ID3D12Device* device)
+{
+    D3D12_RESOURCE_DESC bufferDesc {};
+    bufferDesc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    bufferDesc.Width = g.stagedBytes;
+    bufferDesc.Height = 1;
+    bufferDesc.DepthOrArraySize = 1;
+    bufferDesc.MipLevels = 1;
+    bufferDesc.Format = DXGI_FORMAT_UNKNOWN;
+    bufferDesc.SampleDesc.Count = 1;
+    bufferDesc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+
+    D3D12_HEAP_PROPERTIES readbackHeap {};
+    readbackHeap.Type = D3D12_HEAP_TYPE_READBACK;
+    D3D12_HEAP_PROPERTIES uploadHeap {};
+    uploadHeap.Type = D3D12_HEAP_TYPE_UPLOAD;
+    D3D12_HEAP_PROPERTIES defaultHeap {};
+    defaultHeap.Type = D3D12_HEAP_TYPE_DEFAULT;
+    D3D12_RANGE nothing { 0, 0 };
+
+    gs.readback[0] = g.readback;
+    gs.upload[0] = g.upload;
+    gs.readbackMapped[0] = g.readbackMapped;
+    gs.uploadMapped[0] = g.uploadMapped;
+
+    for (unsigned int i = 1; i < SyncExchange::kSlots; ++i)
+    {
+        if (FAILED(device->CreateCommittedResource(&readbackHeap, D3D12_HEAP_FLAG_NONE, &bufferDesc,
+                                                   D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                                   IID_PPV_ARGS(&gs.readback[i]))) ||
+            FAILED(device->CreateCommittedResource(&uploadHeap, D3D12_HEAP_FLAG_NONE, &bufferDesc,
+                                                   D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
+                                                   IID_PPV_ARGS(&gs.upload[i]))) ||
+            FAILED(gs.readback[i]->Map(0, nullptr, reinterpret_cast<void**>(&gs.readbackMapped[i]))) ||
+            FAILED(gs.upload[i]->Map(0, &nothing, reinterpret_cast<void**>(&gs.uploadMapped[i]))))
+        {
+            Fail("the per-frame staging slots could not be allocated");
+            return false;
+        }
+
+        gs.readback[i]->SetName(i == 1 ? L"DLSS-NR readback 1" : L"DLSS-NR readback 2");
+        gs.upload[i]->SetName(i == 1 ? L"DLSS-NR upload 1" : L"DLSS-NR upload 2");
+    }
+
+    D3D12_RESOURCE_DESC small = bufferDesc;
+    small.Width = SyncExchange::kStride * SyncExchange::kSlots;
+    D3D12_RESOURCE_DESC ring = bufferDesc;
+    ring.Width = SyncExchange::kStride * SyncExchange::kSeqRing;
+    D3D12_RESOURCE_DESC hop = bufferDesc;
+    hop.Width = SyncExchange::kStride;
+
+    uint64_t* flagsWritable = nullptr;
+
+    if (FAILED(device->CreateCommittedResource(&readbackHeap, D3D12_HEAP_FLAG_NONE, &small,
+                                               D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&gs.flags))) ||
+        FAILED(device->CreateCommittedResource(&uploadHeap, D3D12_HEAP_FLAG_NONE, &ring,
+                                               D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&gs.seq))) ||
+        FAILED(device->CreateCommittedResource(&defaultHeap, D3D12_HEAP_FLAG_NONE, &hop,
+                                               D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&gs.seqHop))) ||
+        FAILED(gs.flags->Map(0, nullptr, reinterpret_cast<void**>(&flagsWritable))) ||
+        FAILED(gs.seq->Map(0, &nothing, reinterpret_cast<void**>(&gs.seqMapped))))
+    {
+        Fail("the per-frame flags could not be allocated");
+        return false;
+    }
+
+    // Frame numbers start at 1, so a zeroed flag can never be mistaken for a staged frame.
+    for (unsigned int i = 0; i < SyncExchange::kSlots; ++i)
+        flagsWritable[i * (SyncExchange::kStride / 8)] = 0;
+
+    gs.flagsMapped = flagsWritable;
+    gs.flags->SetName(L"DLSS-NR sync flags");
+    gs.seq->SetName(L"DLSS-NR sync ring");
+    gs.seqHop->SetName(L"DLSS-NR sync hop");
+    return true;
+}
+
+void ReleaseSyncStaging()
+{
+    for (unsigned int i = 1; i < SyncExchange::kSlots; ++i)
+    {
+        if (gs.readback[i] != nullptr)
+        {
+            gs.readback[i]->Unmap(0, nullptr);
+            gs.readback[i]->Release();
+        }
+
+        if (gs.upload[i] != nullptr)
+        {
+            gs.upload[i]->Unmap(0, nullptr);
+            gs.upload[i]->Release();
+        }
+    }
+
+    if (gs.flags != nullptr)
+    {
+        gs.flags->Unmap(0, nullptr);
+        gs.flags->Release();
+    }
+
+    if (gs.seq != nullptr)
+    {
+        gs.seq->Unmap(0, nullptr);
+        gs.seq->Release();
+    }
+
+    if (gs.seqHop != nullptr)
+        gs.seqHop->Release();
+
+    // Slot 0 belongs to the exchange, which releases it itself.
+    for (unsigned int i = 0; i < SyncExchange::kSlots; ++i)
+    {
+        gs.readback[i] = nullptr;
+        gs.upload[i] = nullptr;
+        gs.readbackMapped[i] = nullptr;
+        gs.uploadMapped[i] = nullptr;
+        gs.state[i] = SyncExchange::Slot::Free;
+        gs.frameOf[i] = 0;
+    }
+
+    gs.flags = nullptr;
+    gs.flagsMapped = nullptr;
+    gs.seq = nullptr;
+    gs.seqMapped = nullptr;
+    gs.seqHop = nullptr;
+}
+
+void WorkerSyncMain()
+{
+    using Slot = SyncExchange::Slot;
+
+    for (;;)
+    {
+        unsigned int slot = 0;
+        UINT64 frame = 0;
+
+        {
+            std::unique_lock<std::mutex> held(g.lock);
+            g.wake.wait(held,
+                        []
+                        {
+                            if (g.quit)
+                                return true;
+
+                            for (auto st : gs.state)
+                                if (st == Slot::Queued)
+                                    return true;
+
+                            return false;
+                        });
+
+            if (g.quit)
+                break;
+
+            // Oldest first: answers are delivered in frame order.
+            frame = ~UINT64(0);
+
+            for (unsigned int i = 0; i < SyncExchange::kSlots; ++i)
+            {
+                if (gs.state[i] == Slot::Queued && gs.frameOf[i] < frame)
+                {
+                    frame = gs.frameOf[i];
+                    slot = i;
+                }
+            }
+
+            gs.state[slot] = Slot::Running;
+        }
+
+        // Wait for the game's GPU to execute the list that staged this frame. Spin briefly, then sleep
+        // a millisecond at a time; give up after two seconds, which only a list that was never
+        // submitted can take.
+        const auto started = std::chrono::steady_clock::now();
+        bool ready = false;
+
+        for (;;)
+        {
+            if (gs.flagsMapped[slot * (SyncExchange::kStride / 8)] == frame)
+            {
+                ready = true;
+                break;
+            }
+
+            const auto waited = std::chrono::steady_clock::now() - started;
+
+            if (waited > std::chrono::seconds(2))
+                break;
+
+            {
+                std::lock_guard<std::mutex> held(g.lock);
+
+                if (g.quit)
+                    break;
+            }
+
+            if (waited < std::chrono::milliseconds(20))
+                std::this_thread::yield();
+            else
+                Sleep(1);
+        }
+
+        std::atomic_thread_fence(std::memory_order_acquire);
+
+        if (!ready)
+        {
+            std::lock_guard<std::mutex> held(g.lock);
+            gs.state[slot] = Slot::Failed;
+            gs.done.notify_all();
+            continue;
+        }
+
+        const auto copied = std::chrono::steady_clock::now();
+        const auto rowPitch = size_t(g.footprint.Footprint.RowPitch);
+        const auto payload = rowPitch * size_t(ModelHeight);
+
+        Request request {};
+        request.magic = kRequestMagic;
+        request.width = ModelWidth;
+        request.height = ModelHeight;
+        request.format = (uint32_t) g.format;
+        request.rowPitch = (uint32_t) rowPitch;
+        request.bytes = (uint32_t) payload;
+        request.reset = 0;
+        request.sequence = (uint32_t) frame;
+
+        Response response {};
+        const char* broke = nullptr;
+
+        if (!SendAll(g.link, &request, sizeof(request)) || !SendAll(g.link, gs.readbackMapped[slot], payload))
+            broke = "the connection to dlss5-nr-daemon broke while sending a frame";
+        else if (!RecvAll(g.link, &response, sizeof(response)) || response.magic != kResponseMagic)
+            broke = "dlss5-nr-daemon stopped answering";
+        else if (response.status != 0 || response.bytes != payload)
+            broke = "the model failed on the daemon side -- its console says why";
+        else if (!RecvAll(g.link, gs.uploadMapped[slot], payload))
+            broke = "the connection to dlss5-nr-daemon broke while receiving a frame";
+
+        const auto finished = std::chrono::steady_clock::now();
+
+        {
+            std::lock_guard<std::mutex> held(g.lock);
+            gs.state[slot] = broke != nullptr ? Slot::Failed : Slot::Done;
+            gs.readyMs = std::chrono::duration<float, std::milli>(copied - started).count();
+
+            if (broke == nullptr)
+                g.lastMs = std::chrono::duration<float, std::milli>(finished - copied).count();
+
+            gs.done.notify_all();
+        }
+
+        if (broke != nullptr)
+            Fail(broke);
+    }
+}
+
+// The per-frame counterpart of GuardedRecord: every call on the game's list, no C++ object in scope.
+//
+// The flag must not land before the staged pixels have. Two copies in one list are not ordered unless
+// a barrier says so, so the frame number takes a hop through a DEFAULT buffer whose transition between
+// the two copies (COPY_DEST -> COPY_SOURCE, a transfer-to-transfer dependency) orders the staging copy
+// before the flag copy; a global UAV barrier sits beside it for runtimes that elide buffer transitions.
+//
+// Returns the step reached (2-4 deliver, 5-8 stage); negative means it faulted there.
+int GuardedRecordSync(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* modelInput, ID3D12Resource* output,
+                      ID3D12Resource* deliverFrom, ID3D12Resource* stageTo, UINT64 flagOffset, UINT64 seqOffset)
+{
+    int step = 0;
+
+    __try
+    {
+        if (deliverFrom != nullptr)
+        {
+            step = 2;
+            Barrier(cmdList, output, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_DEST);
+            step = 3;
+            CopyBufferToTexture(cmdList, deliverFrom, output);
+            step = 4;
+            Barrier(cmdList, output, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        }
+
+        if (stageTo != nullptr)
+        {
+            step = 5;
+            cmdList->CopyBufferRegion(gs.seqHop, 0, gs.seq, seqOffset, 8);
+
+            step = 6;
+            Barrier(cmdList, modelInput, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                    D3D12_RESOURCE_STATE_COPY_SOURCE);
+            CopyTextureToBuffer(cmdList, modelInput, stageTo);
+            Barrier(cmdList, modelInput, D3D12_RESOURCE_STATE_COPY_SOURCE,
+                    D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+
+            step = 7;
+            Barrier(cmdList, gs.seqHop, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE);
+            D3D12_RESOURCE_BARRIER all {};
+            all.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+            all.UAV.pResource = nullptr;
+            cmdList->ResourceBarrier(1, &all);
+            cmdList->CopyBufferRegion(gs.flags, flagOffset, gs.seqHop, 0, 8);
+            Barrier(cmdList, gs.seqHop, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
+            step = 8;
+        }
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        return -step;
+    }
+
+    return step;
+}
+
+int EvaluateSync(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* modelInput, ID3D12Resource* output, bool reset)
+{
+    using Slot = SyncExchange::Slot;
+    const UINT64 frame = ++g.frame;
+    int deliverSlot = -1;
+    int stageSlot = -1;
+
+    {
+        std::unique_lock<std::mutex> held(g.lock);
+
+        if (reset)
+            g.haveAnswer = false;
+
+        // 1. The previous frame's answer. The render thread waits here, and that wait is the point of
+        //    the mode: it is what makes the game run at the model's pace.
+        int previous = -1;
+
+        for (unsigned int i = 0; i < SyncExchange::kSlots; ++i)
+            if (gs.frameOf[i] == frame - 1 && gs.state[i] != Slot::Free)
+                previous = (int) i;
+
+        const auto waitStart = std::chrono::steady_clock::now();
+
+        if (previous >= 0)
+        {
+            gs.done.wait_until(held, waitStart + SyncWait(),
+                               [previous]
+                               {
+                                   return g.quit || gs.state[previous] == Slot::Done ||
+                                          gs.state[previous] == Slot::Failed;
+                               });
+
+            if (gs.state[previous] == Slot::Done)
+            {
+                deliverSlot = previous;
+                gs.state[previous] = Slot::Free;
+                g.haveAnswer = true;
+                g.deliveredAtFrame = frame;
+                g.answerFromFrame = frame - 1;
+                NoteDeliveryLocked();
+            }
+            else if (gs.state[previous] == Slot::Failed)
+            {
+                gs.state[previous] = Slot::Free;
+            }
+            else
+            {
+                gs.timeouts++; // still in flight: compose with the answer already on screen
+            }
+        }
+
+        gs.waitMs = std::chrono::duration<float, std::milli>(std::chrono::steady_clock::now() - waitStart).count();
+
+        // 2. This frame. A slot still Done holds an answer that missed its frame; it is simply reused.
+        const unsigned int slot = (unsigned int) (frame % SyncExchange::kSlots);
+
+        if (gs.state[slot] == Slot::Free || gs.state[slot] == Slot::Done || gs.state[slot] == Slot::Failed)
+            stageSlot = (int) slot;
+        else
+            gs.skipped++;
+    }
+
+    const UINT64 seqOffset = (frame % SyncExchange::kSeqRing) * SyncExchange::kStride;
+
+    if (stageSlot >= 0)
+        gs.seqMapped[seqOffset / 8] = frame;
+
+    const int reached =
+        GuardedRecordSync(cmdList, modelInput, output, deliverSlot >= 0 ? gs.upload[deliverSlot] : nullptr,
+                          stageSlot >= 0 ? gs.readback[stageSlot] : nullptr,
+                          UINT64(stageSlot >= 0 ? stageSlot : 0) * SyncExchange::kStride, seqOffset);
+
+    if (reached < 0)
+    {
+        Fail("faulted while recording per-frame step " + std::to_string(-reached) + " (2-4 deliver, 5-8 stage)");
+        return 0;
+    }
+
+    bool haveAnswer = false;
+
+    {
+        std::lock_guard<std::mutex> held(g.lock);
+
+        if (stageSlot >= 0)
+        {
+            gs.frameOf[stageSlot] = frame;
+            gs.state[stageSlot] = Slot::Queued;
+            g.recordedAtFrame = frame;
+            g.wake.notify_one();
+        }
+
+        haveAnswer = g.haveAnswer;
+
+        // What each frame costs, every 64 frames: how long the render thread waited, how long the
+        // game's GPU took to reach the staging copy, and the model's round trip.
+        if (frame % 64 == 0)
+            LOG_INFO("DLSS-NR (HIP sync): frame {} | render thread waited {:.1f} ms | staging copy ran after "
+                     "{:.1f} ms | model round trip {:.1f} ms | answer every {:.1f} ms | timeouts {} | skipped {}",
+                     frame, gs.waitMs, gs.readyMs, g.lastMs, g.answerIntervalMs, gs.timeouts, gs.skipped);
+    }
+
+    g_stagedLast = stageSlot >= 0;
+    g_deliveredLast = deliverSlot >= 0;
+    return haveAnswer ? 1 : 0;
+}
+
 } // namespace
 
 // What this backend is allowed to do, from DLSS5_NR_MODE. Each mode is a strict superset of the one
@@ -866,17 +1417,26 @@ int Evaluate(ID3D12GraphicsCommandList* cmdList, ID3D12CommandQueue* queue, ID3D
             return 0;
 
         Describe(device, queue, output, desc, mode);
-        const bool made = CreateStaging(device, desc, useQueue);
+        const bool sync = SyncActive(mode);
+        const bool made = CreateStaging(device, desc, useQueue) && (!sync || CreateSyncStaging(device));
         device->Release();
 
         if (!made)
             return 0;
 
-        g.worker = std::thread(WorkerMain);
+        g.worker = std::thread(sync ? WorkerSyncMain : WorkerMain);
+
+        if (sync)
+            LOG_INFO("DLSS-NR (HIP): per-frame mode (DLSS5_NR_SYNC=1): every frame goes to the model and the "
+                     "render thread waits up to {} ms for the previous frame's answer",
+                     (int) SyncWait().count());
     }
 
     if (mode == 1)
         return 0; // the buffers exist, the worker is up, and nothing else happens. That is the test.
+
+    if (SyncActive(mode))
+        return EvaluateSync(cmdList, modelInput, output, reset);
 
     UINT64 tick = 0;
 
@@ -1040,6 +1600,8 @@ void Release()
         g.winsock = false;
     }
 
+    ReleaseSyncStaging();
+
     g.modelReady = false;
     g.stage = Exchange::Stage::Idle;
     g.haveAnswer = false;
@@ -1062,6 +1624,8 @@ const char* Status()
 // The only thing that means "stop asking". Everything else Evaluate can answer is a frame that had
 // nothing to compose, which is not a fault and must not be latched.
 bool Failed() { return g_failed; }
+
+bool SyncMode() { return Enabled() && SyncActive(Mode()); }
 
 // How many frames have passed since the scene the current answer describes.
 //

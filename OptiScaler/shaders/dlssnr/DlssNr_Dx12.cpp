@@ -1673,6 +1673,11 @@ float SteadyStaleness()
 
     last = now;
 
+    // Per-frame mode (0030): the answer on screen is the previous frame's, or the one before when an
+    // answer missed its wait. Nothing to estimate.
+    if (DlssNr::Hip::SyncMode())
+        return (float) DlssNr::Hip::FramesSinceAnswer();
+
     const float modelMs = DlssNr::Hip::LastModelMs();
 
     if (modelMs <= 0.0f || frameMs <= 0.0f)
@@ -1723,7 +1728,8 @@ float BlendAlphaSetting()
     if (alpha < 0.0f)
     {
         char value[32] {};
-        alpha = 0.15f;
+        // Per-frame mode (0030) has a fresh answer every frame; easing toward it would only lag it.
+        alpha = DlssNr::Hip::SyncMode() ? 1.0f : 0.15f;
 
         if (GetEnvironmentVariableA("DLSS5_NR_BLEND", value, sizeof(value)) != 0 && value[0] != 0)
         {

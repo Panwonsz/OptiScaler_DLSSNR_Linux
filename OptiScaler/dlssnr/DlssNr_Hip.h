@@ -117,5 +117,11 @@ bool DeliveredLastFrame();
 // one has completed.
 float LastModelMs();
 
+// Per-frame synchronous mode (DLSS5_NR_SYNC=1 with mode 5, the default): every frame is sent to the model
+// and the render thread waits for the previous frame's answer, so the game runs at the model's pace and
+// the answer on screen is exactly one frame old. FramesSinceAnswer() then reads 1 (2 on a frame whose
+// answer missed its wait). False when the backend is off or in the asynchronous exchange.
+bool SyncMode();
+
 } // namespace Hip
 } // namespace DlssNr
