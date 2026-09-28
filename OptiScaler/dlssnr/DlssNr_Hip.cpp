@@ -864,20 +864,20 @@ bool CreateSyncStaging(ID3D12Device* device)
         gs.upload[i]->SetName(i == 1 ? L"DLSS-NR upload 1" : L"DLSS-NR upload 2");
     }
 
-    D3D12_RESOURCE_DESC small = bufferDesc;
-    small.Width = SyncExchange::kStride * SyncExchange::kSlots;
-    D3D12_RESOURCE_DESC ring = bufferDesc;
-    ring.Width = SyncExchange::kStride * SyncExchange::kSeqRing;
-    D3D12_RESOURCE_DESC hop = bufferDesc;
-    hop.Width = SyncExchange::kStride;
+    D3D12_RESOURCE_DESC flagDesc = bufferDesc;
+    flagDesc.Width = SyncExchange::kStride * SyncExchange::kSlots;
+    D3D12_RESOURCE_DESC ringDesc = bufferDesc;
+    ringDesc.Width = SyncExchange::kStride * SyncExchange::kSeqRing;
+    D3D12_RESOURCE_DESC hopDesc = bufferDesc;
+    hopDesc.Width = SyncExchange::kStride;
 
     uint64_t* flagsWritable = nullptr;
 
-    if (FAILED(device->CreateCommittedResource(&readbackHeap, D3D12_HEAP_FLAG_NONE, &small,
+    if (FAILED(device->CreateCommittedResource(&readbackHeap, D3D12_HEAP_FLAG_NONE, &flagDesc,
                                                D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&gs.flags))) ||
-        FAILED(device->CreateCommittedResource(&uploadHeap, D3D12_HEAP_FLAG_NONE, &ring,
+        FAILED(device->CreateCommittedResource(&uploadHeap, D3D12_HEAP_FLAG_NONE, &ringDesc,
                                                D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&gs.seq))) ||
-        FAILED(device->CreateCommittedResource(&defaultHeap, D3D12_HEAP_FLAG_NONE, &hop,
+        FAILED(device->CreateCommittedResource(&defaultHeap, D3D12_HEAP_FLAG_NONE, &hopDesc,
                                                D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&gs.seqHop))) ||
         FAILED(gs.flags->Map(0, nullptr, reinterpret_cast<void**>(&flagsWritable))) ||
         FAILED(gs.seq->Map(0, &nothing, reinterpret_cast<void**>(&gs.seqMapped))))
