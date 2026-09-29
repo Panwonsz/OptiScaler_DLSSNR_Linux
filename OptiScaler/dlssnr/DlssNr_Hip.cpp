@@ -83,7 +83,7 @@ struct Response
 
 // Printed at init. Two builds in a row produced an identical failure, and nothing in the log said
 // whether the second one was the DLL actually being loaded.
-constexpr const char* kBuildMark = "2026-09-29b";
+constexpr const char* kBuildMark = "2026-09-29c";
 
 // ---------------------------------------------------------------------------------------------
 // Pixel conversion does not happen here any more.
@@ -947,6 +947,118 @@ void ReleaseSyncStaging()
     gs.seqHop = nullptr;
 }
 
+// ---------------------------------------------------------------------------------------------
+// The model inside the game (DLSS5_NR_INPROC=1 with DLSS5_NR_SYNC=1, 2026-09-29).
+//
+// Stage 3 of the in-game path. The per-frame exchange above stays exactly as it is -- slots, flags,
+// the render thread's wait -- and only the worker's round trip changes: instead of sending the staged
+// frame to dlss5-nr-daemon and reading the answer back over loopback, it hands the two mapped buffers
+// to dlss5_run_staged in this process. That entry does the daemon's DecodeRow / model / EncodeRow with
+// the conversions on the GPU and writes exactly the bytes the daemon would have sent
+// (hip/tests/test_staged.cpp checks that).
+//
+// Loaded the way the stage 2 probe proved works: dlss5_hip.dll from OptiScaler's folder, the preload
+// shim in LD_PRELOAD, DLSS5_HIP_LIBRARY pointing at the bundled libdlss5_hip.so, DLSS5_HIP_WEIGHTS.
+// The model is loaded once per process and kept across a device re-creation, as the daemon keeps its
+// weights across game launches.
+namespace InProcess
+{
+using InitFn = int (*)(const char*, int);
+using StagedFn = int (*)(const void*, void*, unsigned int, unsigned int, unsigned int);
+using ErrorFn = const char* (*)();
+using GpuMsFn = double (*)();
+
+struct Model
+{
+    HMODULE dll = nullptr;
+    StagedFn staged = nullptr;
+    ErrorFn error = nullptr;
+    GpuMsFn gpuMs = nullptr;
+    bool ready = false;
+};
+
+Model m;
+
+bool Requested()
+{
+    static int on = -1;
+
+    if (on < 0)
+    {
+        char value[8] {};
+        on = GetEnvironmentVariableA("DLSS5_NR_INPROC", value, sizeof(value)) != 0 && value[0] == '1' &&
+                     value[1] == 0
+                 ? 1
+                 : 0;
+    }
+
+    return on == 1;
+}
+
+std::string ErrorText()
+{
+    const char* text = m.error != nullptr ? m.error() : nullptr;
+    return text != nullptr && text[0] != 0 ? std::string(text) : std::string("(no message)");
+}
+
+// Empty on success, otherwise why not.
+std::string Load()
+{
+    if (m.ready)
+        return {};
+
+    static const int anchor = 0;
+    HMODULE self = nullptr;
+    wchar_t path[MAX_PATH] {};
+
+    if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                            reinterpret_cast<LPCWSTR>(&anchor), &self) ||
+        GetModuleFileNameW(self, path, MAX_PATH) == 0)
+        return "cannot find OptiScaler's own folder";
+
+    std::wstring dll(path);
+    const size_t slash = dll.find_last_of(L"\\/");
+    dll.resize(slash != std::wstring::npos ? slash : 0);
+    dll += L"\\dlss5_hip.dll";
+
+    if (m.dll == nullptr)
+        m.dll = LoadLibraryW(dll.c_str());
+
+    if (m.dll == nullptr)
+        return "dlss5_hip.dll not loadable from OptiScaler's folder (error " + std::to_string(GetLastError()) + ")";
+
+    auto init = reinterpret_cast<InitFn>(GetProcAddress(m.dll, "dlss5_init"));
+    m.staged = reinterpret_cast<StagedFn>(GetProcAddress(m.dll, "dlss5_run_staged"));
+    m.error = reinterpret_cast<ErrorFn>(GetProcAddress(m.dll, "dlss5_last_error"));
+    m.gpuMs = reinterpret_cast<GpuMsFn>(GetProcAddress(m.dll, "dlss5_last_gpu_ms"));
+
+    if (init == nullptr || m.staged == nullptr || m.error == nullptr)
+        return "dlss5_hip.dll lacks dlss5_run_staged -- rebuild it from the HIP repo (hip-31)";
+
+    const auto started = std::chrono::steady_clock::now();
+
+    // Null weights: the Linux side reads DLSS5_HIP_WEIGHTS.
+    if (init(nullptr, 0) != 0)
+        return "dlss5_init failed: " + ErrorText();
+
+    m.ready = true;
+    LOG_INFO("DLSS-NR (HIP): model initialised inside the game in {:.0f} ms",
+             std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count());
+    return {};
+}
+
+// The daemon's round trip, in place. Empty on success.
+std::string Run(const void* in, void* out, uint32_t format, uint32_t pitch, uint32_t seed)
+{
+    if (m.staged(in, out, format, pitch, seed) == 0)
+        return {};
+
+    return "the in-process model failed: " + ErrorText();
+}
+
+double GpuMs() { return m.gpuMs != nullptr ? m.gpuMs() : -1.0; }
+} // namespace InProcess
+
 void WorkerSyncMain()
 {
     using Slot = SyncExchange::Slot;
@@ -1046,9 +1158,12 @@ void WorkerSyncMain()
         request.sequence = (uint32_t) frame;
 
         Response response {};
-        const char* broke = nullptr;
+        std::string broke;
 
-        if (!SendAll(g.link, &request, sizeof(request)) || !SendAll(g.link, gs.readbackMapped[slot], payload))
+        if (InProcess::m.ready)
+            broke = InProcess::Run(gs.readbackMapped[slot], gs.uploadMapped[slot], request.format, request.rowPitch,
+                                   request.sequence);
+        else if (!SendAll(g.link, &request, sizeof(request)) || !SendAll(g.link, gs.readbackMapped[slot], payload))
             broke = "the connection to dlss5-nr-daemon broke while sending a frame";
         else if (!RecvAll(g.link, &response, sizeof(response)) || response.magic != kResponseMagic)
             broke = "dlss5-nr-daemon stopped answering";
@@ -1061,16 +1176,20 @@ void WorkerSyncMain()
 
         {
             std::lock_guard<std::mutex> held(g.lock);
-            gs.state[slot] = broke != nullptr ? Slot::Failed : Slot::Done;
+            gs.state[slot] = !broke.empty() ? Slot::Failed : Slot::Done;
             gs.readyMs = std::chrono::duration<float, std::milli>(copied - started).count();
 
-            if (broke == nullptr)
+            if (broke.empty())
                 g.lastMs = std::chrono::duration<float, std::milli>(finished - copied).count();
 
             gs.done.notify_all();
         }
 
-        if (broke != nullptr)
+        if (InProcess::m.ready && broke.empty() && frame % 64 == 0)
+            LOG_INFO("DLSS-NR (HIP in-process): frame {} | model call {:.1f} ms, of which GPU {:.1f} ms", frame,
+                     std::chrono::duration<double, std::milli>(finished - copied).count(), InProcess::GpuMs());
+
+        if (!broke.empty())
             Fail(broke);
     }
 }
@@ -1450,7 +1569,7 @@ void StartOnce()
 {
     static std::atomic<bool> started { false };
 
-    if (!Requested() || started.exchange(true))
+    if (!Requested() || InProcess::Requested() || started.exchange(true))
         return;
 
     LOG_INFO("DLSS-NR in-process probe: starting (DLSS5_NR_INPROC_PROBE=1)");
@@ -1472,6 +1591,31 @@ bool Ensure(ID3D12Device* device)
         return false;
 
     InProcessProbe::StartOnce();
+
+    if (InProcess::Requested())
+    {
+        if (!SyncActive(Mode()))
+        {
+            LOG_WARN("DLSS-NR (HIP): DLSS5_NR_INPROC=1 needs DLSS5_NR_SYNC=1 (and mode 5); using the daemon");
+        }
+        else
+        {
+            const std::string why = InProcess::Load();
+
+            if (!why.empty())
+            {
+                Fail("in-process model: " + why);
+                return false;
+            }
+
+            g.device = device;
+            g.modelReady = true;
+            Say("ready");
+            LOG_INFO("DLSS-NR (HIP): model running inside the game (DLSS5_NR_INPROC=1), {}x{} [build {} mode {}]",
+                     ModelWidth, ModelHeight, kBuildMark, Mode());
+            return true;
+        }
+    }
 
     // Winsock inside a game process: WSAStartup is reference-counted, and the game has certainly
     // called it already, so this is a formality that keeps the accounting straight.
