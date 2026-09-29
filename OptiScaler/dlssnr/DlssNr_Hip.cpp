@@ -83,7 +83,7 @@ struct Response
 
 // Printed at init. Two builds in a row produced an identical failure, and nothing in the log said
 // whether the second one was the DLL actually being loaded.
-constexpr const char* kBuildMark = "2026-09-29a";
+constexpr const char* kBuildMark = "2026-09-29b";
 
 // ---------------------------------------------------------------------------------------------
 // Pixel conversion does not happen here any more.
@@ -1411,8 +1411,9 @@ void Run()
     for (uint32_t y = 0; y < kHeight; y++)
         for (uint32_t x = 0; x < kWidth; x++)
             for (uint32_t c = 0; c < 4; c++)
-                input[(size_t(y) * kWidth + x) * 4 + c] = float((x * 7 + y * 13 + c * 29) % 256) / 255.0f;
+                input[(size_t(y) * kWidth + x) * 4 + c] = float((x * 7 + y * 13 + c * 29) % 256) * 0.00390625f; // k * 2^-8: exact under /fp:fast
 
+    const uint64_t inputDigest = Digest(input);
     double millis[5] {};
     uint64_t digests[5] {};
 
@@ -1437,8 +1438,8 @@ void Run()
         replay = replay && digests[i] == digests[0];
 
     LOG_INFO("DLSS-NR in-process probe: 5 runs {:.1f} {:.1f} {:.1f} {:.1f} {:.1f} ms (wall, incl. host copies) | "
-             "output digest {:016x} | replay {}",
-             millis[0], millis[1], millis[2], millis[3], millis[4], digests[0], replay ? "equal" : "DIFFERS");
+             "input digest {:016x} | output digest {:016x} | replay {}",
+             millis[0], millis[1], millis[2], millis[3], millis[4], inputDigest, digests[0], replay ? "equal" : "DIFFERS");
 
     // The daemon keeps serving the game; free this copy's VRAM.
     shutdown();
