@@ -83,7 +83,7 @@ struct Response
 
 // Printed at init. Two builds in a row produced an identical failure, and nothing in the log said
 // whether the second one was the DLL actually being loaded.
-constexpr const char* kBuildMark = "2026-09-29c";
+constexpr const char* kBuildMark = "2026-09-29d";
 
 // ---------------------------------------------------------------------------------------------
 // Pixel conversion does not happen here any more.
@@ -811,6 +811,18 @@ struct SyncExchange
     UINT64 frameOf[kSlots] {};
     std::condition_variable done; // with g.lock
 
+    // Zero-copy (in-process only): a shared DEFAULT-heap pair per slot, their handles as HIP imported them,
+    // and which buffers each queued job was staged in.
+    ID3D12Resource* sharedIn[kSlots] {};
+    ID3D12Resource* sharedOut[kSlots] {};
+    HANDLE sharedInHandle[kSlots] {};
+    HANDLE sharedOutHandle[kSlots] {};
+    std::atomic<bool> zeroCopy { false };
+    uint32_t zcGeneration = 0;
+    bool zcStaged[kSlots] {};
+    bool verify[kSlots] {};
+    ID3D12Resource* verifyTo = nullptr; // this frame's extra mapped copy (DLSS5_NR_ZC_VERIFY)
+
     // For the log.
     float waitMs = 0.0f;  // the render thread, waiting for the previous answer
     float readyMs = 0.0f; // the worker, waiting for the game's GPU to run the staging copy
@@ -967,6 +979,9 @@ using InitFn = int (*)(const char*, int);
 using StagedFn = int (*)(const void*, void*, unsigned int, unsigned int, unsigned int);
 using ErrorFn = const char* (*)();
 using GpuMsFn = double (*)();
+using ImportFn = int (*)(void*, unsigned long long, unsigned int);
+using SharedFn = int (*)(void*, void*, unsigned long long, unsigned int, unsigned int, unsigned int, unsigned int,
+                         const void*);
 
 struct Model
 {
@@ -974,6 +989,8 @@ struct Model
     StagedFn staged = nullptr;
     ErrorFn error = nullptr;
     GpuMsFn gpuMs = nullptr;
+    ImportFn importShared = nullptr; // hip-32; absent in older builds
+    SharedFn runShared = nullptr;
     bool ready = false;
 };
 
@@ -1031,6 +1048,8 @@ std::string Load()
     m.staged = reinterpret_cast<StagedFn>(GetProcAddress(m.dll, "dlss5_run_staged"));
     m.error = reinterpret_cast<ErrorFn>(GetProcAddress(m.dll, "dlss5_last_error"));
     m.gpuMs = reinterpret_cast<GpuMsFn>(GetProcAddress(m.dll, "dlss5_last_gpu_ms"));
+    m.importShared = reinterpret_cast<ImportFn>(GetProcAddress(m.dll, "dlss5_import_shared"));
+    m.runShared = reinterpret_cast<SharedFn>(GetProcAddress(m.dll, "dlss5_run_shared"));
 
     if (init == nullptr || m.staged == nullptr || m.error == nullptr)
         return "dlss5_hip.dll lacks dlss5_run_staged -- rebuild it from the HIP repo (hip-31)";
@@ -1059,6 +1078,182 @@ std::string Run(const void* in, void* out, uint32_t format, uint32_t pitch, uint
 double GpuMs() { return m.gpuMs != nullptr ? m.gpuMs() : -1.0; }
 } // namespace InProcess
 
+// ---------------------------------------------------------------------------------------------
+// Zero-copy (stage 4, 2026-09-29; on unless DLSS5_NR_ZEROCOPY=0, in-process mode only).
+//
+// The mapped path moves every frame across PCIe four times: the game's GPU copies the proxy into a
+// READBACK buffer (system memory), HIP uploads it, HIP downloads the answer into an UPLOAD buffer, and the
+// game's GPU copies that back. Here each slot gets a pair of DEFAULT-heap buffers created with
+// D3D12_HEAP_FLAG_SHARED instead; their Win32 shared handles are imported into HIP once
+// (dlss5_import_shared: shared handle -> dma-buf fd -> hipImportExternalMemory), and the model reads the
+// staged proxy and writes its answer in video memory where the game's copies find them.
+//
+// Nothing else changes. The flag still says when the staging copy has run (it follows the copy into the
+// shared buffer through the same hop and barriers), the slots rotate the same way, and the render thread
+// waits the same way. Each job remembers which buffers it was staged in, so a failure can drop back to the
+// mapped buffers from the next frame on without mixing the two.
+//
+// DLSS5_NR_ZC_VERIFY=1: every 64th frame is also staged into the mapped READBACK slot, and HIP compares
+// the two inputs byte for byte (a D3D12 -> HIP visibility check that nothing offline can make).
+bool ZeroCopyWanted()
+{
+    static int on = -1;
+
+    if (on < 0)
+    {
+        char value[8] {};
+        on = GetEnvironmentVariableA("DLSS5_NR_ZEROCOPY", value, sizeof(value)) != 0 && value[0] == '0' ? 0 : 1;
+    }
+
+    return on == 1;
+}
+
+bool ZeroCopyVerify()
+{
+    static int on = -1;
+
+    if (on < 0)
+    {
+        char value[8] {};
+        on = GetEnvironmentVariableA("DLSS5_NR_ZC_VERIFY", value, sizeof(value)) != 0 && value[0] == '1' ? 1 : 0;
+    }
+
+    return on == 1;
+}
+
+std::string HexResult(HRESULT hr)
+{
+    char text[16];
+    snprintf(text, sizeof(text), "0x%08X", (unsigned) hr);
+    return text;
+}
+
+void ReleaseZeroCopy()
+{
+    gs.zeroCopy = false;
+
+    for (unsigned int i = 0; i < SyncExchange::kSlots; ++i)
+    {
+        if (gs.sharedInHandle[i] != nullptr)
+            CloseHandle(gs.sharedInHandle[i]);
+
+        if (gs.sharedOutHandle[i] != nullptr)
+            CloseHandle(gs.sharedOutHandle[i]);
+
+        if (gs.sharedIn[i] != nullptr)
+            gs.sharedIn[i]->Release();
+
+        if (gs.sharedOut[i] != nullptr)
+            gs.sharedOut[i]->Release();
+
+        gs.sharedInHandle[i] = nullptr;
+        gs.sharedOutHandle[i] = nullptr;
+        gs.sharedIn[i] = nullptr;
+        gs.sharedOut[i] = nullptr;
+        gs.zcStaged[i] = false;
+        gs.verify[i] = false;
+    }
+
+    gs.verifyTo = nullptr;
+}
+
+void SetupZeroCopy(ID3D12Device* device)
+{
+    if (!ZeroCopyWanted() || InProcess::m.importShared == nullptr || InProcess::m.runShared == nullptr)
+    {
+        LOG_INFO("DLSS-NR (HIP): zero-copy off ({}); the model uses the mapped staging buffers",
+                 !ZeroCopyWanted() ? "DLSS5_NR_ZEROCOPY=0"
+                                   : "dlss5_hip.dll has no dlss5_run_shared -- rebuild it from the HIP repo (hip-32)");
+        return;
+    }
+
+    D3D12_RESOURCE_DESC desc {};
+    desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    desc.Width = g.stagedBytes;
+    desc.Height = 1;
+    desc.DepthOrArraySize = 1;
+    desc.MipLevels = 1;
+    desc.Format = DXGI_FORMAT_UNKNOWN;
+    desc.SampleDesc.Count = 1;
+    desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+
+    D3D12_HEAP_PROPERTIES heap {};
+    heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+
+    gs.zcGeneration++;
+    std::string why;
+    HRESULT hr = S_OK;
+
+    for (unsigned int i = 0; i < SyncExchange::kSlots && why.empty(); ++i)
+    {
+        // The input is only ever a copy destination on the game's side, the output only a copy source, so
+        // each stays in one state for its whole life and no transition is ever recorded for them.
+        if (FAILED(hr = device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_SHARED, &desc,
+                                                        D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                                        IID_PPV_ARGS(&gs.sharedIn[i]))))
+            why = "creating a shared input buffer failed (" + HexResult(hr) + ")";
+        else if (FAILED(hr = device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_SHARED, &desc,
+                                                             D3D12_RESOURCE_STATE_COPY_SOURCE, nullptr,
+                                                             IID_PPV_ARGS(&gs.sharedOut[i]))))
+            why = "creating a shared output buffer failed (" + HexResult(hr) + ")";
+        else if (FAILED(hr = device->CreateSharedHandle(gs.sharedIn[i], nullptr, GENERIC_ALL, nullptr,
+                                                        &gs.sharedInHandle[i])) ||
+                 FAILED(hr = device->CreateSharedHandle(gs.sharedOut[i], nullptr, GENERIC_ALL, nullptr,
+                                                        &gs.sharedOutHandle[i])))
+            why = "CreateSharedHandle failed (" + HexResult(hr) + ")";
+        else if (InProcess::m.importShared(gs.sharedInHandle[i], g.stagedBytes, gs.zcGeneration) != 0 ||
+                 InProcess::m.importShared(gs.sharedOutHandle[i], g.stagedBytes, gs.zcGeneration) != 0)
+            why = InProcess::ErrorText();
+    }
+
+    if (!why.empty())
+    {
+        LOG_WARN("DLSS-NR (HIP): zero-copy unavailable, the model uses the mapped staging buffers: {}", why);
+        ReleaseZeroCopy();
+        return;
+    }
+
+    for (unsigned int i = 0; i < SyncExchange::kSlots; ++i)
+    {
+        gs.sharedIn[i]->SetName(L"DLSS-NR shared input");
+        gs.sharedOut[i]->SetName(L"DLSS-NR shared output");
+    }
+
+    gs.zeroCopy = true;
+    LOG_INFO("DLSS-NR (HIP): zero-copy on: the model reads and writes the game's GPU buffers directly "
+             "({} x 2 shared buffers of {} bytes){}",
+             SyncExchange::kSlots, g.stagedBytes,
+             ZeroCopyVerify() ? "; DLSS5_NR_ZC_VERIFY=1: every 64th frame is checked against a mapped copy" : "");
+}
+
+// One job on the shared buffers. False drops this frame (its input is only in the shared buffer) and
+// switches the following frames to the mapped buffers; it is not a failure of the backend.
+bool RunZeroCopy(unsigned int slot, uint32_t format, uint32_t pitch, uint32_t seed, bool verify)
+{
+    const int rc = InProcess::m.runShared(gs.sharedInHandle[slot], gs.sharedOutHandle[slot], g.stagedBytes,
+                                          gs.zcGeneration, format, pitch, seed,
+                                          verify ? gs.readbackMapped[slot] : nullptr);
+
+    if (rc == 0)
+    {
+        if (verify)
+            LOG_INFO("DLSS-NR (HIP zero-copy): verify: the shared input matches the mapped copy byte for byte");
+
+        return true;
+    }
+
+    if (rc == 1)
+    {
+        LOG_WARN("DLSS-NR (HIP zero-copy): {}", InProcess::ErrorText());
+        return true;
+    }
+
+    gs.zeroCopy = false;
+    LOG_WARN("DLSS-NR (HIP zero-copy): {} -- the following frames use the mapped staging buffers",
+             InProcess::ErrorText());
+    return false;
+}
+
 void WorkerSyncMain()
 {
     using Slot = SyncExchange::Slot;
@@ -1067,6 +1262,8 @@ void WorkerSyncMain()
     {
         unsigned int slot = 0;
         UINT64 frame = 0;
+        bool zcJob = false;
+        bool verifyJob = false;
 
         {
             std::unique_lock<std::mutex> held(g.lock);
@@ -1099,6 +1296,8 @@ void WorkerSyncMain()
             }
 
             gs.state[slot] = Slot::Running;
+            zcJob = gs.zcStaged[slot];
+            verifyJob = gs.verify[slot];
         }
 
         // Wait for the game's GPU to execute the list that staged this frame. Spin briefly, then sleep
@@ -1159,8 +1358,11 @@ void WorkerSyncMain()
 
         Response response {};
         std::string broke;
+        bool dropped = false; // zero-copy trouble: this frame is lost, the backend is not
 
-        if (InProcess::m.ready)
+        if (InProcess::m.ready && zcJob)
+            dropped = !RunZeroCopy(slot, request.format, request.rowPitch, request.sequence, verifyJob);
+        else if (InProcess::m.ready)
             broke = InProcess::Run(gs.readbackMapped[slot], gs.uploadMapped[slot], request.format, request.rowPitch,
                                    request.sequence);
         else if (!SendAll(g.link, &request, sizeof(request)) || !SendAll(g.link, gs.readbackMapped[slot], payload))
@@ -1176,17 +1378,18 @@ void WorkerSyncMain()
 
         {
             std::lock_guard<std::mutex> held(g.lock);
-            gs.state[slot] = !broke.empty() ? Slot::Failed : Slot::Done;
+            gs.state[slot] = !broke.empty() || dropped ? Slot::Failed : Slot::Done;
             gs.readyMs = std::chrono::duration<float, std::milli>(copied - started).count();
 
-            if (broke.empty())
+            if (broke.empty() && !dropped)
                 g.lastMs = std::chrono::duration<float, std::milli>(finished - copied).count();
 
             gs.done.notify_all();
         }
 
-        if (InProcess::m.ready && broke.empty() && frame % 64 == 0)
-            LOG_INFO("DLSS-NR (HIP in-process): frame {} | model call {:.1f} ms, of which GPU {:.1f} ms", frame,
+        if (InProcess::m.ready && broke.empty() && !dropped && frame % 64 == 0)
+            LOG_INFO("DLSS-NR (HIP in-process, {}): frame {} | model call {:.1f} ms, of which GPU {:.1f} ms",
+                     zcJob ? "zero-copy" : "mapped", frame,
                      std::chrono::duration<double, std::milli>(finished - copied).count(), InProcess::GpuMs());
 
         if (!broke.empty())
@@ -1228,6 +1431,9 @@ int GuardedRecordSync(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* modelI
             Barrier(cmdList, modelInput, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
                     D3D12_RESOURCE_STATE_COPY_SOURCE);
             CopyTextureToBuffer(cmdList, modelInput, stageTo);
+
+            if (gs.verifyTo != nullptr)
+                CopyTextureToBuffer(cmdList, modelInput, gs.verifyTo);
             Barrier(cmdList, modelInput, D3D12_RESOURCE_STATE_COPY_SOURCE,
                     D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
 
@@ -1317,9 +1523,15 @@ int EvaluateSync(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* modelInput,
     if (stageSlot >= 0)
         gs.seqMapped[seqOffset / 8] = frame;
 
+    const bool zc = gs.zeroCopy;
+    const bool verifyThis = zc && stageSlot >= 0 && ZeroCopyVerify() && frame % 64 == 1;
+    const bool deliverZc = deliverSlot >= 0 && gs.zcStaged[deliverSlot];
+    gs.verifyTo = verifyThis ? gs.readback[stageSlot] : nullptr;
+
     const int reached =
-        GuardedRecordSync(cmdList, modelInput, output, deliverSlot >= 0 ? gs.upload[deliverSlot] : nullptr,
-                          stageSlot >= 0 ? gs.readback[stageSlot] : nullptr,
+        GuardedRecordSync(cmdList, modelInput, output,
+                          deliverSlot >= 0 ? (deliverZc ? gs.sharedOut[deliverSlot] : gs.upload[deliverSlot]) : nullptr,
+                          stageSlot >= 0 ? (zc ? gs.sharedIn[stageSlot] : gs.readback[stageSlot]) : nullptr,
                           UINT64(stageSlot >= 0 ? stageSlot : 0) * SyncExchange::kStride, seqOffset);
 
     if (reached < 0)
@@ -1336,6 +1548,8 @@ int EvaluateSync(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* modelInput,
         if (stageSlot >= 0)
         {
             gs.frameOf[stageSlot] = frame;
+            gs.zcStaged[stageSlot] = zc;
+            gs.verify[stageSlot] = verifyThis;
             gs.state[stageSlot] = Slot::Queued;
             g.recordedAtFrame = frame;
             g.wake.notify_one();
@@ -1723,6 +1937,9 @@ int Evaluate(ID3D12GraphicsCommandList* cmdList, ID3D12CommandQueue* queue, ID3D
         Describe(device, queue, output, desc, mode);
         const bool sync = SyncActive(mode);
         const bool made = CreateStaging(device, desc, useQueue) && (!sync || CreateSyncStaging(device));
+
+        if (made && sync && InProcess::m.ready)
+            SetupZeroCopy(device);
         device->Release();
 
         if (!made)
@@ -1904,6 +2121,7 @@ void Release()
         g.winsock = false;
     }
 
+    ReleaseZeroCopy();
     ReleaseSyncStaging();
 
     g.modelReady = false;
