@@ -83,7 +83,7 @@ struct Response
 
 // Printed at init. Two builds in a row produced an identical failure, and nothing in the log said
 // whether the second one was the DLL actually being loaded.
-constexpr const char* kBuildMark = "2026-09-28a";
+constexpr const char* kBuildMark = "2026-09-29a";
 
 // ---------------------------------------------------------------------------------------------
 // Pixel conversion does not happen here any more.
@@ -1300,6 +1300,163 @@ bool Enabled()
     return same(value, "hip") || same(value, "amd") || same(value, "1") || same(value, "true");
 }
 
+// ---------------------------------------------------------------------------------------------
+// In-process probe (stage 2 of the in-game path; DLSS5_NR_INPROC_PROBE=1, 2026-09-29).
+//
+// Answers one question before any in-process transport is written: does the model come up and run
+// INSIDE this game process? It loads dlss5_hip.dll from OptiScaler's folder (the PE trampoline, which
+// finds the preloaded libdlss5_hip_preload.so through the live Unix environment), initialises the
+// model, runs it five times on a fixed synthetic 1920x1080 frame, logs the times and an output digest,
+// and shuts it down again. The daemon path is untouched and keeps running the game's frames.
+//
+// hip/tests/probe_inproc_host.py runs the same frame on the host and prints the same digest: equal
+// digests mean the in-process model computes exactly what the daemon's does.
+namespace InProcessProbe
+{
+using InitFn = int (*)(const char*, int);
+using RunFn = int (*)(const float*, float*, unsigned int);
+using ErrorFn = const char* (*)();
+using ShutdownFn = void (*)();
+
+constexpr uint32_t kWidth = 1920;
+constexpr uint32_t kHeight = 1080;
+
+bool Requested()
+{
+    char value[8] {};
+    return GetEnvironmentVariableA("DLSS5_NR_INPROC_PROBE", value, sizeof(value)) != 0 && value[0] == '1';
+}
+
+std::wstring ModuleFolder()
+{
+    static const int anchor = 0;
+    HMODULE self = nullptr;
+    wchar_t path[MAX_PATH] {};
+
+    if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                            reinterpret_cast<LPCWSTR>(&anchor), &self) ||
+        GetModuleFileNameW(self, path, MAX_PATH) == 0)
+        return L".";
+
+    std::wstring folder(path);
+    const size_t slash = folder.find_last_of(L"\\/");
+
+    if (slash != std::wstring::npos)
+        folder.resize(slash);
+
+    return folder;
+}
+
+// sum over i of bits[i] * (2i + 1), mod 2^64 -- probe_inproc_host.py computes the same.
+uint64_t Digest(const std::vector<float>& values)
+{
+    uint64_t sum = 0;
+
+    for (size_t i = 0; i < values.size(); i++)
+    {
+        uint32_t bits;
+        std::memcpy(&bits, &values[i], sizeof(bits));
+        sum += uint64_t(bits) * (uint64_t(i) * 2u + 1u);
+    }
+
+    return sum;
+}
+
+void Run()
+{
+    const std::wstring path = ModuleFolder() + L"\\dlss5_hip.dll";
+    HMODULE dll = LoadLibraryW(path.c_str());
+
+    if (dll == nullptr)
+    {
+        LOG_ERROR("DLSS-NR in-process probe: dlss5_hip.dll not loadable from OptiScaler's folder (error {})",
+                  (unsigned) GetLastError());
+        return;
+    }
+
+    auto init = reinterpret_cast<InitFn>(GetProcAddress(dll, "dlss5_init"));
+    auto run = reinterpret_cast<RunFn>(GetProcAddress(dll, "dlss5_run"));
+    auto lastError = reinterpret_cast<ErrorFn>(GetProcAddress(dll, "dlss5_last_error"));
+    auto shutdown = reinterpret_cast<ShutdownFn>(GetProcAddress(dll, "dlss5_shutdown"));
+
+    if (init == nullptr || run == nullptr || lastError == nullptr || shutdown == nullptr)
+    {
+        LOG_ERROR("DLSS-NR in-process probe: dlss5_hip.dll lacks the dlss5_* exports");
+        return;
+    }
+
+    auto errorText = [&]()
+    {
+        const char* text = lastError();
+        return std::string(text != nullptr && text[0] != 0 ? text : "(no message)");
+    };
+
+    auto started = std::chrono::steady_clock::now();
+    auto since = [](std::chrono::steady_clock::time_point from)
+    { return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - from).count(); };
+
+    // Null weights: the Linux side reads DLSS5_HIP_WEIGHTS.
+    if (init(nullptr, 0) != 0)
+    {
+        LOG_ERROR("DLSS-NR in-process probe: dlss5_init failed after {:.0f} ms: {}", since(started),
+                  errorText());
+        return;
+    }
+
+    LOG_INFO("DLSS-NR in-process probe: model initialised inside the game in {:.0f} ms", since(started));
+
+    std::vector<float> input(size_t(kWidth) * kHeight * 4);
+    std::vector<float> output(size_t(kWidth) * kHeight * 3);
+
+    for (uint32_t y = 0; y < kHeight; y++)
+        for (uint32_t x = 0; x < kWidth; x++)
+            for (uint32_t c = 0; c < 4; c++)
+                input[(size_t(y) * kWidth + x) * 4 + c] = float((x * 7 + y * 13 + c * 29) % 256) / 255.0f;
+
+    double millis[5] {};
+    uint64_t digests[5] {};
+
+    for (int i = 0; i < 5; i++)
+    {
+        started = std::chrono::steady_clock::now();
+
+        if (run(input.data(), output.data(), 0) != 0)
+        {
+            LOG_ERROR("DLSS-NR in-process probe: dlss5_run {} failed: {}", i + 1, errorText());
+            shutdown();
+            return;
+        }
+
+        millis[i] = since(started);
+        digests[i] = Digest(output);
+    }
+
+    bool replay = true;
+
+    for (int i = 1; i < 5; i++)
+        replay = replay && digests[i] == digests[0];
+
+    LOG_INFO("DLSS-NR in-process probe: 5 runs {:.1f} {:.1f} {:.1f} {:.1f} {:.1f} ms (wall, incl. host copies) | "
+             "output digest {:016x} | replay {}",
+             millis[0], millis[1], millis[2], millis[3], millis[4], digests[0], replay ? "equal" : "DIFFERS");
+
+    // The daemon keeps serving the game; free this copy's VRAM.
+    shutdown();
+    LOG_INFO("DLSS-NR in-process probe: done, model shut down");
+}
+
+void StartOnce()
+{
+    static std::atomic<bool> started { false };
+
+    if (!Requested() || started.exchange(true))
+        return;
+
+    LOG_INFO("DLSS-NR in-process probe: starting (DLSS5_NR_INPROC_PROBE=1)");
+    std::thread(Run).detach();
+}
+} // namespace InProcessProbe
+
 bool Ensure(ID3D12Device* device)
 {
     std::lock_guard<std::mutex> once(g_once);
@@ -1312,6 +1469,8 @@ bool Ensure(ID3D12Device* device)
 
     if (device == nullptr)
         return false;
+
+    InProcessProbe::StartOnce();
 
     // Winsock inside a game process: WSAStartup is reference-counted, and the game has certainly
     // called it already, so this is a formality that keeps the accounting straight.
